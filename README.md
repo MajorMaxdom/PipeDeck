@@ -1,9 +1,8 @@
-# WireMix
+# PipeDeck
 
 A browser-based audio mixer for **PipeWire / PulseAudio** on Linux.  
 Control volumes, routing, and virtual sinks from any device on your local network — desktop, tablet, or phone.
 
-![WireMix](https://raw.githubusercontent.com/MajorMaxdom/WireMix/refs/heads/main/wiremix.png)
 ---
 
 ## Features
@@ -21,18 +20,10 @@ Control volumes, routing, and virtual sinks from any device on your local networ
 
 ---
 
-## Disclaimer
-This tool was completely vibe coded with Claude Code within 48 hours.
-I needed a working Voicemeeter-Replacement, as I switched from Windows to Ubuntu.
-As long as my Claude Code subscription is running, I'll try to let it update and fix anything that shows up.
-If something doesn't work, I am more than happy to accept any pull requests.
-
----
-
 ## Prerequisites
 
 ### Audio system
-WireMix requires **PipeWire** with the PulseAudio compatibility layer, or a native **PulseAudio** installation.
+PipeDeck requires **PipeWire** with the PulseAudio compatibility layer, or a native **PulseAudio** installation.
 
 ```bash
 # Ubuntu / Debian — PipeWire (recommended, default since Ubuntu 22.10)
@@ -79,8 +70,8 @@ pip3 install websockets
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/MajorMaxdom/WireMix.git
-   cd pulsewireweb
+   git clone https://github.com/YOUR_USERNAME/pipedeck.git
+   cd pipedeck
    ```
 
 2. **Create the sounds folder** (optional, for the soundboard)
@@ -92,7 +83,7 @@ pip3 install websockets
 3. **Run manually** to verify everything works
    ```bash
    python3 server.py
-   # → PulseWire Web started
+   # → PipeDeck started
    # →   Local:   http://localhost:8080
    # →   Network: http://192.168.x.x:8080
    ```
@@ -102,7 +93,7 @@ pip3 install websockets
 
 ## Auto-start at login (systemd user service)
 
-A systemd user service starts WireMix automatically whenever you log in — no root required.
+A systemd user service starts PipeDeck automatically whenever you log in — no root required.
 
 ### Install the service
 
@@ -111,17 +102,17 @@ A systemd user service starts WireMix automatically whenever you log in — no r
    mkdir -p ~/.config/systemd/user
    ```
 
-2. Create the service file at `~/.config/systemd/user/wiremix.service`:
+2. Create the service file at `~/.config/systemd/user/pipedeck.service`:
    ```ini
    [Unit]
-   Description=WireMix – browser-based PipeWire/PulseAudio mixer
+   Description=PipeDeck – browser-based PipeWire/PulseAudio mixer
    After=pipewire.service pipewire-pulse.service
    Wants=pipewire.service pipewire-pulse.service
 
    [Service]
    Type=simple
-   WorkingDirectory=/path/to/pulsewireweb
-   ExecStart=/usr/bin/python3 /path/to/pulsewireweb/server.py
+   WorkingDirectory=/path/to/pipedeck
+   ExecStart=/usr/bin/python3 /path/to/pipedeck/server.py
    Restart=on-failure
    RestartSec=5
    StandardOutput=journal
@@ -131,27 +122,27 @@ A systemd user service starts WireMix automatically whenever you log in — no r
    [Install]
    WantedBy=default.target
    ```
-   Replace `/path/to/pulsewireweb` with the actual path (e.g. `/home/yourname/pulsewireweb`).
+   Replace `/path/to/pipedeck` with the actual path (e.g. `/home/yourname/pipedeck`).
 
 3. Enable and start the service:
    ```bash
    systemctl --user daemon-reload
-   systemctl --user enable wiremix.service
-   systemctl --user start wiremix.service
+   systemctl --user enable pipedeck.service
+   systemctl --user start pipedeck.service
    ```
 
 4. Check that it is running:
    ```bash
-   systemctl --user status wiremix.service
+   systemctl --user status pipedeck.service
    ```
 
 ### Useful service commands
 
 ```bash
-systemctl --user stop    wiremix.service   # stop
-systemctl --user restart wiremix.service   # restart
-systemctl --user disable wiremix.service   # remove from auto-start
-journalctl --user -u wiremix.service -f    # live logs
+systemctl --user stop    pipedeck.service   # stop
+systemctl --user restart pipedeck.service   # restart
+systemctl --user disable pipedeck.service   # remove from auto-start
+journalctl --user -u pipedeck.service -f    # live logs
 ```
 
 ---
@@ -189,22 +180,22 @@ These files are created automatically. You can delete them to reset all settings
 
 ## Accessing from other devices
 
-WireMix binds to `0.0.0.0`, so it is reachable from any device on your local network:
+PipeDeck binds to `0.0.0.0`, so it is reachable from any device on your local network:
 
 ```
 http://192.168.x.x:8080
 ```
 
-Your server's IP address is printed in the terminal / journal when WireMix starts. For permanent access from a tablet or phone, bookmark that URL or use your browser's "Add to Home Screen" option — WireMix is a PWA and will open full-screen.
+Your server's IP address is printed in the terminal / journal when PipeDeck starts. For permanent access from a tablet or phone, bookmark that URL or use your browser's "Add to Home Screen" option — PipeDeck is a PWA and will open full-screen.
 
-> **Security note:** WireMix has no authentication. Only run it on a trusted local network.
+> **Security note:** PipeDeck has no authentication. Only run it on a trusted local network.
 
 ---
 
 ## Project structure
 
 ```
-pulsewireweb/
+pipedeck/
 ├── server.py            # Python backend (WebSocket + HTTP server)
 ├── settings.json        # Persisted UI and routing settings (auto-created)
 ├── virtual_sinks.json   # Persisted virtual sink config (auto-created)
@@ -232,5 +223,5 @@ pulsewireweb/
 ---
 
 ## License
-https://github.com/MajorMaxdom/WireMix.git
+
 MIT

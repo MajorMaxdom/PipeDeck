@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PulseWire Web — browser-based PipeWire/PulseAudio mixer backend."""
+"""PipeDeck — browser-based PipeWire/PulseAudio mixer backend."""
 import asyncio
 import json
 import os
@@ -664,7 +664,7 @@ async def main():
     await peak_monitors.update(state["sinks"], state["sources"], state["sinkInputs"])
 
     async with serve(ws_handler, "0.0.0.0", WS_PORT):
-        print("PulseWire Web started")
+        print("PipeDeck started")
         print(f"  Local:   http://localhost:{HTTP_PORT}")
         print(f"  Network: http://<YOUR-IP>:{HTTP_PORT}")
         await asyncio.gather(
