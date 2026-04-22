@@ -70,7 +70,7 @@ pip3 install websockets
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/YOUR_USERNAME/wiremix.git
+   git clone https://github.com/MajorMaxdom/WireMix.git
    cd pulsewireweb
    ```
 
@@ -223,5 +223,5 @@ pulsewireweb/
 ---
 
 ## License
-
+https://github.com/MajorMaxdom/WireMix.git
 MIT
