@@ -19,9 +19,13 @@
     <header>
       <div class="logo">
         <span class="logo-icon">▐█▌</span>
-        <span class="logo-text">PIPEDECK <span class="logo-sub">v0.10</span></span>
+        <span class="logo-text">PIPEDECK <span class="logo-sub">v0.31</span></span>
       </div>
-      <div class="zoom-controls">
+      <div class="scene-controls">
+        <span id="scene-btns"></span>
+        <button class="zoom-btn" id="scenes-btn" type="button" title="Manage Scenes">▤</button>
+      </div>
+<div class="zoom-controls">
         <button class="zoom-btn" id="zoom-out" type="button">−</button>
         <span id="zoom-label">100%</span>
         <button class="zoom-btn" id="zoom-in"  type="button">+</button>
@@ -33,6 +37,8 @@
         <span id="status-label">Connecting…</span>
       </div>
     </header>
+
+    <div id="panel-tabs" class="panel-tabs"></div>
 
     <main id="main">
       <section class="panel" id="panel-inputs">
@@ -53,6 +59,7 @@
         <div class="panel-header">
           <span class="panel-icon">▶</span>
           <span class="panel-title">APPLICATIONS</span>
+          <input type="text" id="app-filter" class="app-filter-input" placeholder="filter…" autocomplete="off">
         </div>
         <div class="strips-scroll">
           <div class="strips" id="strips-sinkinputs"></div>
@@ -108,9 +115,39 @@
               <div class="sb-empty">Drop .mp3 / .wav files<br>into <code>sounds/</code></div>
             </div>
           </div>
+          <div class="media-vresize" id="rh-macro-v"></div>
+          <div class="macro-panel" id="macro-panel">
+            <div class="sb-topbar">
+              <span class="sb-label">MACROS</span>
+              <button class="media-btn" id="macro-add" type="button" title="Add macro">+</button>
+            </div>
+            <div class="macro-grid" id="macro-grid"></div>
+          </div>
         </div>
       </section>
     </main>
+
+    <!-- Macro config overlay -->
+    <div id="macro-cfg-overlay" class="settings-overlay hidden">
+      <div class="settings-modal macro-cfg-modal">
+        <div class="settings-hdr">
+          <span class="panel-title">CONFIGURE MACRO</span>
+          <button class="zoom-btn" id="macro-cfg-close" type="button">✕</button>
+        </div>
+        <div class="settings-body" id="macro-cfg-body"></div>
+      </div>
+    </div>
+
+    <!-- Scenes overlay -->
+    <div id="scenes-overlay" class="settings-overlay hidden">
+      <div class="settings-modal scenes-modal">
+        <div class="settings-hdr">
+          <span class="panel-title">SCENES</span>
+          <button class="zoom-btn" id="scenes-close" type="button">✕</button>
+        </div>
+        <div class="settings-body" id="scenes-body"></div>
+      </div>
+    </div>
 
     <!-- Settings overlay -->
     <div id="settings-overlay" class="settings-overlay hidden">
@@ -119,6 +156,7 @@
           <span class="panel-title">SETTINGS</span>
           <button class="zoom-btn" id="settings-close" type="button">✕</button>
         </div>
+        <div class="settings-tabs" id="settings-tabs"></div>
         <div class="settings-body" id="settings-body"></div>
       </div>
     </div>
