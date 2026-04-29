@@ -1,15 +1,33 @@
 'use strict';
 
+// In-memory localStorage fallback for environments where it is unavailable (e.g. pywebview/WebKit2GTK sandbox)
+if (!window.localStorage) {
+  const _m = {};
+  try {
+    Object.defineProperty(window, 'localStorage', {
+      configurable: true,
+      get: () => ({ getItem: k => Object.prototype.hasOwnProperty.call(_m, k) ? _m[k] : null,
+                    setItem: (k, v) => { _m[k] = String(v); },
+                    removeItem: k => { delete _m[k]; },
+                    clear: () => { for (const k in _m) delete _m[k]; } }),
+    });
+  } catch (_) {}
+}
+
 const WS_PORT  = 8765;
-let   vuSegs      = parseInt(localStorage.getItem('pw-vu-segs') || '32');
-let   vuPeakHold  = localStorage.getItem('pw-vu-peak-hold') !== 'false';
+let   vuSegs       = parseInt(localStorage.getItem('pw-vu-segs') || '32');
+let   vuPeakHold   = localStorage.getItem('pw-vu-peak-hold') !== 'false';
 let   vuPeakHoldMs = parseInt(localStorage.getItem('pw-vu-peak-hold-ms') || '2000');
 let   stereoMeters = localStorage.getItem('pw-stereo-meters') === 'true';
+let   vuIntervalMs = parseInt(localStorage.getItem('pw-vu-interval-ms') || '100');
 let vuBoost = parseFloat(localStorage.getItem('pw-vu-boost') || '1.13');
 let smoothMute = localStorage.getItem('pw-smooth-mute') === 'true';
 let appFilter  = '';
+let showHiddenApps = false;
 const vuPeakState = new WeakMap(); // vu element → { peak, timer }
 const stripRemovalTimers = new Map(); // sink-input index → timeout id
+const _stripMap = new Map(); // peak-key → strip element
+let _macroDragId = null; // id of macro currently being dragged
 const ZOOM_STEP = 0.1;
 const ZOOM_MIN  = 0.4;
 const ZOOM_MAX  = 2.5;
@@ -26,12 +44,23 @@ let preSoloMutes  = {};          // "type:index" → boolean mute state before s
 let scenes = [];   // persisted scene list
 let macros = [];   // persisted macro buttons
 
+let clientName = localStorage.getItem('pd-client') || null;
+let _macrosMigrated = !!clientName; // existing profiles don't need migration
+let _cachedProfiles = null;
+
 const SCENE_ICONS = ['🎮','🎵','🎙','🎧','📻','🎬','💼','🏠','📞','🔔','🎯','⭐','🎤','📺','🎹','🔴','🟢','🔵','🟡','🟠'];
 
 function genId() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
 
-let accentColor = localStorage.getItem('pw-accent') || '#00d4aa';
-let stripWidth  = parseInt(localStorage.getItem('pw-strip-w') || '82');
+let accentColor    = localStorage.getItem('pw-accent') || '#00d4aa';
+let stripWidth     = parseInt(localStorage.getItem('pw-strip-w') || '82');
+let autoFitInputs  = localStorage.getItem('pw-autofit-inputs')  === 'true';
+let autoFitOutputs = localStorage.getItem('pw-autofit-outputs') === 'true';
+let lightMode      = localStorage.getItem('pw-light-mode') === 'true';
+
+function applyTheme() {
+  document.documentElement.classList.toggle('light', lightMode);
+}
 
 const VIRTUAL_COLOR = '#7744cc';
 const SINK_PALETTE  = [
@@ -48,16 +77,20 @@ const SINK_PALETTE  = [
 // ── Sink colors ───────────────────────────────────────────────────────────
 
 const SINK_COLORS_KEY = 'pw-sink-colors';
+let _sinkColors = null;
 
 function loadSinkColors() {
-  try { return JSON.parse(localStorage.getItem(SINK_COLORS_KEY) || '{}'); }
-  catch { return {}; }
+  if (_sinkColors !== null) return _sinkColors;
+  try { _sinkColors = JSON.parse(localStorage.getItem(SINK_COLORS_KEY) || '{}'); }
+  catch { _sinkColors = {}; }
+  return _sinkColors;
 }
 
 function saveSinkColor(sinkIndex, color) {
   const map = loadSinkColors();
   map[sinkIndex] = color;
   localStorage.setItem(SINK_COLORS_KEY, JSON.stringify(map));
+  _sinkColors = map;
   schedSendSettings();
 }
 
@@ -65,10 +98,19 @@ function getSinkColor(sinkIndex) {
   return loadSinkColors()[sinkIndex] || null;
 }
 
+// For hardware/source strips: one color controls both tint and band.
 function applyColorToStrip(strip, color) {
   strip.style.setProperty('--strip-color', color || 'transparent');
   const band = strip.querySelector('.color-band');
   if (band) band.style.background = color || 'transparent';
+}
+
+// For app strips: sink color drives the background tint; app color drives the band accent.
+// This way changing an output color always updates the tint even when the app has its own color.
+function applyAppStripColors(strip, appColor, sinkColor) {
+  strip.style.setProperty('--strip-color', sinkColor || 'transparent');
+  const band = strip.querySelector('.color-band');
+  if (band) band.style.background = appColor || '#ffffff';
 }
 
 // Returns saved color, or VIRTUAL_COLOR if the sink is virtual, or null
@@ -84,7 +126,7 @@ function getEffectiveSinkColor(sinkIndex) {
 function applyColorsToAppStrips(sinkIndex) {
   const sinkColor = getEffectiveSinkColor(sinkIndex);
   document.querySelectorAll(`.strip[data-type="sink-input"][data-sink="${sinkIndex}"]`)
-    .forEach(s => applyColorToStrip(s, getAppColor(s.dataset.appkey || '') || sinkColor));
+    .forEach(s => applyAppStripColors(s, getAppColor(s.dataset.appkey || ''), sinkColor));
 }
 
 // Populate a source-routing dropdown with virtual sinks
@@ -108,7 +150,7 @@ function refreshAllAppColors() {
   document.querySelectorAll('.strip[data-type="sink-input"]').forEach(s => {
     const appColor = getAppColor(s.dataset.appkey || '');
     const sinkColor = s.dataset.sink != null ? getEffectiveSinkColor(s.dataset.sink) : null;
-    applyColorToStrip(s, appColor || sinkColor);
+    applyAppStripColors(s, appColor, sinkColor);
     const cp = s.querySelector('.color-pick');
     if (cp && appColor) cp.value = appColor;
   });
@@ -117,16 +159,20 @@ function refreshAllAppColors() {
 // ── App names (custom rename per app-name key) ────────────────────────────
 
 const APP_NAMES_KEY = 'pw-app-names';
+let _appNames = null;
 
 function loadAppNames() {
-  try { return JSON.parse(localStorage.getItem(APP_NAMES_KEY) || '{}'); }
-  catch { return {}; }
+  if (_appNames !== null) return _appNames;
+  try { _appNames = JSON.parse(localStorage.getItem(APP_NAMES_KEY) || '{}'); }
+  catch { _appNames = {}; }
+  return _appNames;
 }
 
 function saveAppName(appKey, name) {
   const map = loadAppNames();
   if (name) map[appKey] = name; else delete map[appKey];
   localStorage.setItem(APP_NAMES_KEY, JSON.stringify(map));
+  _appNames = map;
   schedSendSettings();
 }
 
@@ -138,16 +184,20 @@ function getAppName(appKey) {
 // ── App colors (per app-name, overrides sink color) ───────────────────────
 
 const APP_COLORS_KEY = 'pw-app-colors';
+let _appColors = null;
 
 function loadAppColors() {
-  try { return JSON.parse(localStorage.getItem(APP_COLORS_KEY) || '{}'); }
-  catch { return {}; }
+  if (_appColors !== null) return _appColors;
+  try { _appColors = JSON.parse(localStorage.getItem(APP_COLORS_KEY) || '{}'); }
+  catch { _appColors = {}; }
+  return _appColors;
 }
 
 function saveAppColor(appKey, color) {
   const map = loadAppColors();
   if (color) map[appKey] = color; else delete map[appKey];
   localStorage.setItem(APP_COLORS_KEY, JSON.stringify(map));
+  _appColors = map;
   schedSendSettings();
 }
 
@@ -161,91 +211,148 @@ function getAppColor(appKey) {
 let settingsApplied = false;
 let settingsTimer   = null;
 
+// Sends only shared (cross-device) settings via WebSocket
 function sendSettings() {
+  send({
+    type: 'save_settings',
+    hidden_devices: [...getHidden()],
+    hidden_apps: [...getHiddenApps()],
+    ui: {
+      sink_colors: loadSinkColors(),
+      app_colors: loadAppColors(),
+      app_names: loadAppNames(),
+      channel_names: channelNames,
+      stereo_meters: stereoMeters,
+      vu_interval_ms: vuIntervalMs,
+    },
+  });
+}
+
+// Saves per-device UI layout + macros to the server-side client settings file
+function saveClientSettings() {
+  if (!clientName) return;
   const panelWidths = {};
   for (const id of ['panel-inputs', 'panel-outputs', 'panel-media']) {
     const p = document.getElementById(id);
     if (p && p.style.width) panelWidths[id] = p.style.width;
   }
   const mediaTop = document.getElementById('media-top');
-  send({
-    type: 'save_settings',
-    hidden_devices: [...getHidden()],
-    ui: {
+  fetch('/api/client-settings/' + encodeURIComponent(clientName), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
       zoom,
       vu_segs: vuSegs,
       vu_boost: vuBoost,
       smooth_mute: smoothMute,
       vu_peak_hold: vuPeakHold,
       vu_peak_hold_ms: vuPeakHoldMs,
-      stereo_meters: stereoMeters,
       media_visible: mediaVisible,
+      inputs_visible: inputsVisible,
+      outputs_visible: outputsVisible,
       panel_widths: panelWidths,
       media_top_height: (mediaTop && mediaTop.style.height) || null,
-      sink_colors: loadSinkColors(),
-      app_colors: loadAppColors(),
-      app_names: loadAppNames(),
-      channel_names: channelNames,
       accent_color: accentColor,
       strip_width: stripWidth,
-    },
+      auto_fit_inputs: autoFitInputs,
+      auto_fit_outputs: autoFitOutputs,
+      light_mode: lightMode,
+      macros,
+    }),
   });
+}
+
+let _clientSettingsTimer = null;
+function schedSaveClientSettings() {
+  clearTimeout(_clientSettingsTimer);
+  _clientSettingsTimer = setTimeout(saveClientSettings, 300);
 }
 
 function schedSendSettings() {
   clearTimeout(settingsTimer);
-  settingsTimer = setTimeout(sendSettings, 300);
+  settingsTimer = setTimeout(() => { sendSettings(); saveClientSettings(); }, 300);
 }
 
+// Applies only shared (cross-device) settings received via WebSocket
 function applyServerSettings(settings) {
   if (settings.hidden_devices !== undefined) {
     localStorage.setItem(HIDDEN_KEY, JSON.stringify(settings.hidden_devices));
+    _hidden = new Set(settings.hidden_devices);
+  }
+  if (settings.hidden_apps !== undefined) {
+    localStorage.setItem(HIDDEN_APPS_KEY, JSON.stringify(settings.hidden_apps));
+    _hiddenApps = new Set(settings.hidden_apps);
   }
   const ui = settings.ui || {};
-  if (ui.zoom != null) {
-    zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, parseFloat(ui.zoom) || 1));
-    localStorage.setItem('pw-zoom', zoom);
-    applyZoom();
-  }
-  if (ui.vu_segs != null) {
-    vuSegs = Math.max(8, Math.min(64, parseInt(ui.vu_segs) || 32));
-    localStorage.setItem('pw-vu-segs', vuSegs);
-  }
-  if (ui.vu_boost != null) {
-    vuBoost = Math.max(1.0, Math.min(4.0, parseFloat(ui.vu_boost) || 1.13));
-    localStorage.setItem('pw-vu-boost', vuBoost);
-  }
-  if (ui.smooth_mute != null) {
-    smoothMute = !!ui.smooth_mute;
-    localStorage.setItem('pw-smooth-mute', smoothMute);
-  }
-  if (ui.vu_peak_hold != null) {
-    vuPeakHold = !!ui.vu_peak_hold;
-    localStorage.setItem('pw-vu-peak-hold', vuPeakHold);
-  }
-  if (ui.vu_peak_hold_ms != null) {
-    vuPeakHoldMs = Math.max(200, Math.min(10000, parseInt(ui.vu_peak_hold_ms) || 2000));
-    localStorage.setItem('pw-vu-peak-hold-ms', vuPeakHoldMs);
-  }
   if (ui.stereo_meters != null) {
     stereoMeters = !!ui.stereo_meters;
     localStorage.setItem('pw-stereo-meters', stereoMeters);
   }
-  if (ui.media_visible != null) {
-    mediaVisible = !!ui.media_visible;
-    localStorage.setItem('pw-media-visible', mediaVisible);
-    applyMediaVisibility();
+  if (ui.vu_interval_ms != null) {
+    vuIntervalMs = Math.max(33, Math.min(500, parseInt(ui.vu_interval_ms) || 100));
+    localStorage.setItem('pw-vu-interval-ms', vuIntervalMs);
   }
   if (ui.sink_colors && Object.keys(ui.sink_colors).length > 0) {
     localStorage.setItem(SINK_COLORS_KEY, JSON.stringify(ui.sink_colors));
+    _sinkColors = ui.sink_colors;
   }
   if (ui.app_colors && Object.keys(ui.app_colors).length > 0) {
     localStorage.setItem(APP_COLORS_KEY, JSON.stringify(ui.app_colors));
+    _appColors = ui.app_colors;
   }
   if (ui.app_names && Object.keys(ui.app_names).length > 0) {
     localStorage.setItem(APP_NAMES_KEY, JSON.stringify(ui.app_names));
+    _appNames = ui.app_names;
   }
-  const pw = ui.panel_widths || {};
+  if (ui.channel_names && typeof ui.channel_names === 'object') {
+    channelNames = ui.channel_names;
+  }
+}
+
+// Applies per-device UI layout + macros loaded from the client settings file
+function applyClientSettings(data) {
+  if (!data || !Object.keys(data).length) return;
+  if (data.zoom != null) {
+    zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, parseFloat(data.zoom) || 1));
+    localStorage.setItem('pw-zoom', zoom);
+    applyZoom();
+  }
+  if (data.vu_segs != null) {
+    vuSegs = Math.max(8, Math.min(64, parseInt(data.vu_segs) || 32));
+    localStorage.setItem('pw-vu-segs', vuSegs);
+  }
+  if (data.vu_boost != null) {
+    vuBoost = Math.max(1.0, Math.min(4.0, parseFloat(data.vu_boost) || 1.13));
+    localStorage.setItem('pw-vu-boost', vuBoost);
+  }
+  if (data.smooth_mute != null) {
+    smoothMute = !!data.smooth_mute;
+    localStorage.setItem('pw-smooth-mute', smoothMute);
+  }
+  if (data.vu_peak_hold != null) {
+    vuPeakHold = !!data.vu_peak_hold;
+    localStorage.setItem('pw-vu-peak-hold', vuPeakHold);
+  }
+  if (data.vu_peak_hold_ms != null) {
+    vuPeakHoldMs = Math.max(200, Math.min(10000, parseInt(data.vu_peak_hold_ms) || 2000));
+    localStorage.setItem('pw-vu-peak-hold-ms', vuPeakHoldMs);
+  }
+  if (data.media_visible != null) {
+    mediaVisible = !!data.media_visible;
+    localStorage.setItem('pw-media-visible', mediaVisible);
+    applyMediaVisibility();
+  }
+  if (data.inputs_visible != null) {
+    inputsVisible = !!data.inputs_visible;
+    localStorage.setItem('pw-inputs-visible', inputsVisible);
+    applyInputsVisibility();
+  }
+  if (data.outputs_visible != null) {
+    outputsVisible = !!data.outputs_visible;
+    localStorage.setItem('pw-outputs-visible', outputsVisible);
+    applyOutputsVisibility();
+  }
+  const pw = data.panel_widths || {};
   for (const id of ['panel-inputs', 'panel-outputs', 'panel-media']) {
     const w = pw[id];
     if (w) {
@@ -253,22 +360,36 @@ function applyServerSettings(settings) {
       if (p) { p.style.width = w; p.style.flexShrink = '0'; localStorage.setItem('pw-panel-' + id, w); }
     }
   }
-  if (ui.media_top_height) {
+  if (data.media_top_height) {
     const el = document.getElementById('media-top');
-    if (el) { el.style.height = ui.media_top_height; el.style.flexShrink = '0'; localStorage.setItem('pw-media-top-h', ui.media_top_height); }
+    if (el) { el.style.height = data.media_top_height; el.style.flexShrink = '0'; localStorage.setItem('pw-media-top-h', data.media_top_height); }
   }
-  if (ui.channel_names && typeof ui.channel_names === 'object') {
-    channelNames = ui.channel_names;
-  }
-  if (ui.accent_color) {
-    accentColor = ui.accent_color;
+  if (data.accent_color) {
+    accentColor = data.accent_color;
     localStorage.setItem('pw-accent', accentColor);
     applyAccentColor(accentColor);
   }
-  if (ui.strip_width != null) {
-    stripWidth = Math.max(60, Math.min(140, parseInt(ui.strip_width) || 82));
+  if (data.strip_width != null) {
+    stripWidth = Math.max(60, Math.min(140, parseInt(data.strip_width) || 82));
     localStorage.setItem('pw-strip-w', stripWidth);
     applyStripWidth(stripWidth);
+  }
+  if (data.auto_fit_inputs != null) {
+    autoFitInputs = !!data.auto_fit_inputs;
+    localStorage.setItem('pw-autofit-inputs', autoFitInputs);
+  }
+  if (data.auto_fit_outputs != null) {
+    autoFitOutputs = !!data.auto_fit_outputs;
+    localStorage.setItem('pw-autofit-outputs', autoFitOutputs);
+  }
+  if (data.light_mode != null) {
+    lightMode = !!data.light_mode;
+    localStorage.setItem('pw-light-mode', lightMode);
+    applyTheme();
+  }
+  if (Array.isArray(data.macros)) {
+    macros = data.macros;
+    renderMacroGrid();
   }
 }
 
@@ -276,20 +397,36 @@ function hasServerSettings(settings) {
   if (!settings) return false;
   if (settings.hidden_devices && settings.hidden_devices.length > 0) return true;
   const ui = settings.ui || {};
-  return ui.zoom != null || ui.vu_segs != null || ui.media_visible != null ||
-         ui.panel_widths || ui.media_top_height ||
+  return ui.stereo_meters != null || ui.vu_interval_ms != null ||
          (ui.sink_colors && Object.keys(ui.sink_colors).length > 0) ||
+         (ui.app_colors && Object.keys(ui.app_colors).length > 0) ||
          (ui.channel_names && Object.keys(ui.channel_names).length > 0);
 }
 
 // ── Media panel visibility ────────────────────────────────────────────────
 
-let mediaVisible = localStorage.getItem('pw-media-visible') !== 'false';
+let mediaVisible   = localStorage.getItem('pw-media-visible')   !== 'false';
+let inputsVisible  = localStorage.getItem('pw-inputs-visible')  !== 'false';
+let outputsVisible = localStorage.getItem('pw-outputs-visible') !== 'false';
 
 function applyMediaVisibility() {
   document.getElementById('panel-media').classList.toggle('collapsed', !mediaVisible);
   document.getElementById('rh-media').classList.toggle('collapsed', !mediaVisible);
   document.getElementById('toggle-media').classList.toggle('toggled', !mediaVisible);
+  updateMobileTabVisibility();
+}
+
+function applyInputsVisibility() {
+  document.getElementById('panel-inputs').classList.toggle('collapsed', !inputsVisible);
+  document.getElementById('rh-left').classList.toggle('collapsed', !inputsVisible);
+  document.getElementById('toggle-inputs').classList.toggle('toggled', !inputsVisible);
+  updateMobileTabVisibility();
+}
+
+function applyOutputsVisibility() {
+  document.getElementById('panel-outputs').classList.toggle('collapsed', !outputsVisible);
+  document.getElementById('rh-right').classList.toggle('collapsed', !outputsVisible);
+  document.getElementById('toggle-outputs').classList.toggle('toggled', !outputsVisible);
   updateMobileTabVisibility();
 }
 
@@ -326,6 +463,28 @@ function applyAccentColor(hex) {
 function applyStripWidth(px) {
   document.documentElement.style.setProperty('--strip-w', px + 'px');
   stripWidth = px;
+  applyPanelAutoFit();
+}
+
+function _autoFitOne(panelId, stripsId) {
+  const panel  = document.getElementById(panelId);
+  const strips = document.getElementById(stripsId);
+  if (!panel || !strips) return;
+  const n = strips.querySelectorAll(':scope > .strip').length;
+  if (n === 0) return;
+  const w = n * (stripWidth + 1) - 1;
+  panel.style.width      = w + 'px';
+  panel.style.flexShrink = '0';
+  localStorage.setItem('pw-panel-' + panelId, panel.style.width);
+}
+
+function applyPanelAutoFit() {
+  if (autoFitInputs)  _autoFitOne('panel-inputs',  'strips-sources');
+  if (autoFitOutputs) _autoFitOne('panel-outputs', 'strips-sinks');
+  const rhLeft  = document.getElementById('rh-left');
+  const rhRight = document.getElementById('rh-right');
+  if (rhLeft)  rhLeft.classList.toggle('autofit-locked',  autoFitInputs);
+  if (rhRight) rhRight.classList.toggle('autofit-locked', autoFitOutputs);
 }
 
 function adjustZoom(d) {
@@ -337,11 +496,19 @@ function adjustZoom(d) {
 
 // ── Panel resize ──────────────────────────────────────────────────────────
 
-function initResize(handle, panel, panelOnLeft) {
+function initResize(handle, panel, panelOnLeft, autoFitKey) {
   // panelOnLeft=true  → drag right widens the panel (panel is left of handle)
   // panelOnLeft=false → drag left  widens the panel (panel is right of handle)
+  // autoFitKey: localStorage key to clear when user manually overrides auto-fit
   handle.addEventListener('pointerdown', (e) => {
     e.preventDefault();
+    // Disable auto-fit for this panel when user drags manually
+    if (autoFitKey) {
+      if (autoFitKey === 'pw-autofit-inputs')  { autoFitInputs  = false; localStorage.setItem('pw-autofit-inputs',  'false'); }
+      if (autoFitKey === 'pw-autofit-outputs') { autoFitOutputs = false; localStorage.setItem('pw-autofit-outputs', 'false'); }
+      handle.classList.remove('autofit-locked');
+      schedSendSettings();
+    }
     const x0 = e.clientX;
     const w0 = panel.offsetWidth;
     handle.setPointerCapture(e.pointerId);
@@ -370,18 +537,28 @@ function initResize(handle, panel, panelOnLeft) {
 // ── WebSocket ──────────────────────────────────────────────────────────────
 
 let ws = null;
+const _sendQueue = [];
 
 function connect() {
   setStatus('connecting');
   ws = new WebSocket(`ws://${window.location.hostname}:${WS_PORT}`);
-  ws.addEventListener('open',    ()   => setStatus('connected'));
+  ws.addEventListener('open', () => {
+    setStatus('connected');
+    while (_sendQueue.length) ws.send(_sendQueue.shift());
+  });
   ws.addEventListener('message', (ev) => onMsg(JSON.parse(ev.data)));
-  ws.addEventListener('close',   ()   => { setStatus('disconnected'); setTimeout(connect, 2500); });
+  ws.addEventListener('close',   ()   => { setStatus('disconnected'); _sendQueue.length = 0; setTimeout(connect, 2500); });
   ws.addEventListener('error',   ()   => ws.close());
 }
 
 function send(obj) {
-  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+  const msg = JSON.stringify(obj);
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(msg);
+  } else {
+    _sendQueue.push(msg);
+    if (_sendQueue.length > 30) _sendQueue.shift(); // cap queue size
+  }
 }
 
 function setStatus(s) {
@@ -413,6 +590,7 @@ function mkVu() {
 }
 
 function rebuildAllStrips() {
+  _stripMap.clear();
   ['strips-sources', 'strips-sinkinputs', 'strips-sinks'].forEach(id => {
     const c = document.getElementById(id);
     if (c) c.innerHTML = '';
@@ -461,15 +639,21 @@ function setVu(vu, level) {
   }
 }
 
-function onPeaks(data) {
-  for (const [key, peak] of Object.entries(data)) {
-    let type, idx;
-    if      (key.startsWith('sink-input-')) { type = 'sink-input'; idx = key.slice(11); }
-    else if (key.startsWith('sink-'))        { type = 'sink';       idx = key.slice(5);  }
-    else if (key.startsWith('source-'))      { type = 'source';     idx = key.slice(7);  }
-    else continue;
+let _pendingPeaks = null;
+let _rafPeaks = null;
 
-    const strip = document.querySelector(`.strip[data-type="${type}"][data-index="${idx}"]`);
+function onPeaks(data) {
+  if (!_pendingPeaks) _pendingPeaks = {};
+  Object.assign(_pendingPeaks, data);
+  if (!_rafPeaks) _rafPeaks = requestAnimationFrame(_flushPeaks);
+}
+
+function _flushPeaks() {
+  _rafPeaks = null;
+  const data = _pendingPeaks;
+  _pendingPeaks = null;
+  for (const [key, peak] of Object.entries(data)) {
+    const strip = _stripMap.get(key);
     if (!strip) continue;
     const vus = strip.querySelectorAll('.vu');
     if (Array.isArray(peak)) {
@@ -499,7 +683,7 @@ function shortLabel(str, max = 13) {
 }
 
 function sinkDisplayName(sink) {
-  return channelNames['sink:' + sink.index] || sink.description || sink.name;
+  return channelNames['sink:' + sink.name] || channelNames['sink:' + sink.index] || sink.description || sink.name;
 }
 
 function fillSelect(sel, activeSinkIdx) {
@@ -611,7 +795,7 @@ function mkStrip(item, type, chNum) {
     const nameEl = document.createElement('div');
     nameEl.className = 'ch-name';
     nameEl.title     = item.description || item.name || '';
-    const _nameKey = type + ':' + item.index;
+    const _nameKey = type + ':' + (item.name || item.index);
     nameEl.textContent = channelNames[_nameKey] || shortLabel(item.description || item.name || '', 11);
     nameEl.addEventListener('dblclick', (e) => {
       e.stopPropagation();
@@ -645,12 +829,32 @@ function mkStrip(item, type, chNum) {
     const appColorInput = document.createElement('input');
     appColorInput.type = 'color';
     appColorInput.className = 'color-pick';
-    appColorInput.value = getAppColor(appKey) || '#888888';
+    appColorInput.value = getAppColor(appKey) || '#ffffff';
     appColorInput.addEventListener('input', () => {
-      saveAppColor(appKey, appColorInput.value);
-      applyColorToStrip(strip, appColorInput.value);
+      const appColor = appColorInput.value;
+      saveAppColor(appKey, appColor);
+      const sinkColor = strip.dataset.sink != null ? getEffectiveSinkColor(strip.dataset.sink) : null;
+      applyAppStripColors(strip, appColor, sinkColor);
     });
     topRow.appendChild(appColorInput);
+
+    const hideBtn = document.createElement('button');
+    hideBtn.className = 'app-hide-btn';
+    hideBtn.type = 'button';
+    hideBtn.title = 'Hide this app';
+    hideBtn.textContent = '✕';
+    hideBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const ha = getHiddenApps();
+      if (ha.has(appKey)) {
+        ha.delete(appKey);
+      } else {
+        ha.add(appKey);
+      }
+      setHiddenApps(ha);
+      applyAppFilter();
+    });
+    topRow.appendChild(hideBtn);
     hdr.appendChild(topRow);
 
     const rawAppName = item.appName || item.mediaName || 'Stream';
@@ -744,7 +948,7 @@ function mkStrip(item, type, chNum) {
       const sinkIdx = parseInt(sel.value, 10);
       if (!isNaN(sinkIdx)) {
         strip.dataset.sink = sinkIdx;
-        applyColorToStrip(strip, getEffectiveSinkColor(sinkIdx));
+        applyAppStripColors(strip, getAppColor((item.appName || item.mediaName || '').toLowerCase()), getEffectiveSinkColor(sinkIdx));
         send({ type: 'move_sink_input', index: item.index, sink: sinkIdx });
       }
     });
@@ -805,8 +1009,9 @@ function mkStrip(item, type, chNum) {
     if (c) applyColorToStrip(strip, c);
   } else if (type === 'sink-input') {
     const appKey = (item.appName || item.mediaName || '').toLowerCase();
-    const c = getAppColor(appKey) || (item.sink != null ? getEffectiveSinkColor(item.sink) : null);
-    if (c) applyColorToStrip(strip, c);
+    const appColor  = getAppColor(appKey);
+    const sinkColor = item.sink != null ? getEffectiveSinkColor(item.sink) : null;
+    applyAppStripColors(strip, appColor, sinkColor);
   } else if (type === 'source') {
     const routedName = sourceRoutes[item.name] || '';
     if (routedName) {
@@ -949,11 +1154,13 @@ function renderSection(stripsId, items, type, labelsId) {
       if (!stripRemovalTimers.has(k)) {
         existing[k].classList.add('removing');
         stripRemovalTimers.set(k, setTimeout(() => {
+          _stripMap.delete('sink-input-' + k);
           existing[k].remove();
           stripRemovalTimers.delete(k);
         }, 1500));
       }
     } else {
+      _stripMap.delete(type + '-' + k);
       existing[k].remove();
     }
   });
@@ -969,6 +1176,7 @@ function renderSection(stripsId, items, type, labelsId) {
     if (key in existing) {
       // ── Update existing strip in place ──
       const strip = existing[key];
+      _stripMap.set(type + '-' + item.index, strip);
       const fader = strip.querySelector('.fader');
       const muteBtn = strip.querySelector('.mute-btn');
 
@@ -979,8 +1187,8 @@ function renderSection(stripsId, items, type, labelsId) {
       // Refresh custom channel name if not currently being edited
       const nameEl2 = strip.querySelector('.ch-name');
       if (nameEl2) {
-        const nk = type + ':' + item.index;
-        nameEl2.textContent = channelNames[nk] || shortLabel(item.description || item.name || '', 11);
+        const nk = type + ':' + (item.name || item.index);
+        nameEl2.textContent = channelNames[nk] || channelNames[type + ':' + item.index] || shortLabel(item.description || item.name || '', 11);
       }
       // Only update mute if it differs from DOM state (avoid overwriting user action mid-flight)
       const domMuted = muteBtn.classList.contains('on');
@@ -992,7 +1200,7 @@ function renderSection(stripsId, items, type, labelsId) {
         if (item.sink != null) {
           strip.dataset.sink = item.sink;
           const appKey = strip.dataset.appkey || '';
-          applyColorToStrip(strip, getAppColor(appKey) || getEffectiveSinkColor(item.sink));
+          applyAppStripColors(strip, getAppColor(appKey), getEffectiveSinkColor(item.sink));
         }
         const sel = strip.querySelector('.sink-sel');
         if (sel) fillSelect(sel, item.sink);
@@ -1020,7 +1228,9 @@ function renderSection(stripsId, items, type, labelsId) {
       // Re-order if needed
       if (cont.children[pos] !== strip) cont.insertBefore(strip, cont.children[pos] || null);
     } else {
-      cont.insertBefore(mkStrip(item, type, pos + 1), cont.children[pos] || null);
+      const _newStrip = mkStrip(item, type, pos + 1);
+      _stripMap.set(type + '-' + item.index, _newStrip);
+      cont.insertBefore(_newStrip, cont.children[pos] || null);
     }
   });
 
@@ -1030,16 +1240,48 @@ function renderSection(stripsId, items, type, labelsId) {
 
 // ── Settings ────────────────────────────────────────────────────────────────
 
-const HIDDEN_KEY = 'pw-hidden';
+const HIDDEN_KEY      = 'pw-hidden';
+const HIDDEN_APPS_KEY = 'pw-hidden-apps';
 let lastState = null;
+let _hidden = null;
+let _hiddenApps = null;
 
 function getHidden() {
-  try { return new Set(JSON.parse(localStorage.getItem(HIDDEN_KEY) || '[]')); }
-  catch { return new Set(); }
+  if (_hidden !== null) return _hidden;
+  try { _hidden = new Set(JSON.parse(localStorage.getItem(HIDDEN_KEY) || '[]')); }
+  catch { _hidden = new Set(); }
+  return _hidden;
 }
 function setHidden(set) {
   localStorage.setItem(HIDDEN_KEY, JSON.stringify([...set]));
+  _hidden = set;
   schedSendSettings();
+}
+
+function getHiddenApps() {
+  if (_hiddenApps !== null) return _hiddenApps;
+  try { _hiddenApps = new Set(JSON.parse(localStorage.getItem(HIDDEN_APPS_KEY) || '[]')); }
+  catch { _hiddenApps = new Set(); }
+  return _hiddenApps;
+}
+function setHiddenApps(set) {
+  localStorage.setItem(HIDDEN_APPS_KEY, JSON.stringify([...set]));
+  _hiddenApps = set;
+  schedSendSettings();
+}
+
+function updateHideAppsToggle() {
+  const btn = document.getElementById('show-hidden-apps-btn');
+  if (!btn) return;
+  const count = getHiddenApps().size;
+  if (count === 0) {
+    showHiddenApps = false;
+    btn.style.display = 'none';
+  } else {
+    btn.style.display = '';
+    btn.title = showHiddenApps ? `Hide ${count} hidden app(s)` : `Show ${count} hidden app(s)`;
+    btn.classList.toggle('toggled', showHiddenApps);
+  }
 }
 
 let settingsTab = localStorage.getItem('pw-settings-tab') || 'display';
@@ -1060,6 +1302,7 @@ function openSettings() {
     ['routing',  'Auto Routing'],
     ['virtual',  'Virtual Outputs'],
     ['backup',   'Backup & Restore'],
+    ['profile',  'Profile'],
   ].forEach(([id, label]) => {
     const btn = document.createElement('button');
     btn.className = 'settings-tab' + (id === settingsTab ? ' active' : '');
@@ -1102,6 +1345,42 @@ function openSettings() {
       txt.textContent = item.description || item.name || 'Unknown';
       lbl.appendChild(txt);
       sec.appendChild(lbl);
+    });
+    body.appendChild(sec);
+  }
+
+  // ── Helper: custom channel names section ─────────────────────────────────
+  function buildCustomNamesSection(type) {
+    const prefix = type + ':';
+    const entries = Object.entries(channelNames).filter(([k]) => k.startsWith(prefix));
+    if (!entries.length) return;
+    const sec = document.createElement('div');
+    sec.className = 'settings-section';
+    const h = document.createElement('div');
+    h.className = 'settings-section-title'; h.textContent = 'Custom Names';
+    sec.appendChild(h);
+    entries.forEach(([key, name]) => {
+      const row = document.createElement('div');
+      row.className = 'settings-row';
+      row.style.gap = '8px';
+      const lbl = document.createElement('span');
+      lbl.style.cssText = 'flex:1;font-size:11px;color:var(--text);';
+      lbl.textContent = name;
+      const sub = document.createElement('span');
+      sub.style.cssText = 'font-size:9px;color:var(--text-dim);';
+      sub.textContent = key.slice(prefix.length);
+      const del = document.createElement('button');
+      del.type = 'button'; del.className = 'zoom-btn';
+      del.title = 'Remove custom name'; del.textContent = '✕';
+      del.addEventListener('click', () => {
+        delete channelNames[key];
+        schedSendSettings();
+        if (lastState) applyState(lastState);
+        row.remove();
+        if (!sec.querySelector('.settings-row')) sec.remove();
+      });
+      row.appendChild(lbl); row.appendChild(sub); row.appendChild(del);
+      sec.appendChild(row);
     });
     body.appendChild(sec);
   }
@@ -1204,6 +1483,30 @@ function openSettings() {
     stRow.appendChild(stCb); stRow.appendChild(stLbl);
     dsec.appendChild(stRow);
 
+    // VU meter rate
+    const rateRow = document.createElement('div');
+    rateRow.className = 'settings-row';
+    const rateLbl = document.createElement('span');
+    rateLbl.textContent = 'Meter update rate'; rateLbl.style.flex = '1';
+    const rateSel = document.createElement('select');
+    rateSel.className = 'settings-loop-sel';
+    [['200', 'Slow (5 fps)'], ['100', 'Normal (10 fps)'], ['50', 'Fast (20 fps)'], ['33', 'Very fast (30 fps)']].forEach(([ms, label]) => {
+      const o = document.createElement('option');
+      o.value = ms; o.textContent = label; o.selected = vuIntervalMs === parseInt(ms);
+      rateSel.appendChild(o);
+    });
+    rateSel.addEventListener('change', () => {
+      vuIntervalMs = parseInt(rateSel.value);
+      localStorage.setItem('pw-vu-interval-ms', vuIntervalMs);
+      schedSendSettings();
+    });
+    const rateNote = document.createElement('span');
+    rateNote.style.cssText = 'font-size:9px;color:var(--text-dim);display:block;margin-top:2px;';
+    rateNote.textContent = 'Higher rates increase CPU usage';
+    rateRow.appendChild(rateLbl); rateRow.appendChild(rateSel);
+    dsec.appendChild(rateRow);
+    dsec.appendChild(rateNote);
+
     body.appendChild(dsec);
 
     // Appearance
@@ -1212,6 +1515,21 @@ function openSettings() {
     const ah = document.createElement('div');
     ah.className = 'settings-section-title'; ah.textContent = 'Appearance';
     asec.appendChild(ah);
+
+    // Light mode
+    const lmRow = document.createElement('label');
+    lmRow.className = 'settings-row';
+    const lmCb = document.createElement('input');
+    lmCb.type = 'checkbox'; lmCb.checked = lightMode;
+    lmCb.addEventListener('change', () => {
+      lightMode = lmCb.checked;
+      localStorage.setItem('pw-light-mode', lightMode);
+      applyTheme();
+      schedSendSettings();
+    });
+    const lmLbl = document.createElement('span'); lmLbl.textContent = 'Light mode';
+    lmRow.appendChild(lmCb); lmRow.appendChild(lmLbl);
+    asec.appendChild(lmRow);
 
     // Smooth mute
     const smRow = document.createElement('label');
@@ -1261,6 +1579,36 @@ function openSettings() {
     swRow.appendChild(swLbl); swRow.appendChild(swSlider); swRow.appendChild(swVal);
     asec.appendChild(swRow);
 
+    // Auto-fit input panel
+    const afiRow = document.createElement('label');
+    afiRow.className = 'settings-row';
+    const afiCb = document.createElement('input');
+    afiCb.type = 'checkbox'; afiCb.checked = autoFitInputs;
+    afiCb.addEventListener('change', () => {
+      autoFitInputs = afiCb.checked;
+      localStorage.setItem('pw-autofit-inputs', autoFitInputs);
+      applyPanelAutoFit();
+      schedSendSettings();
+    });
+    const afiLbl = document.createElement('span'); afiLbl.textContent = 'Auto-fit Input panel to strip count';
+    afiRow.appendChild(afiCb); afiRow.appendChild(afiLbl);
+    asec.appendChild(afiRow);
+
+    // Auto-fit output panel
+    const afoRow = document.createElement('label');
+    afoRow.className = 'settings-row';
+    const afoCb = document.createElement('input');
+    afoCb.type = 'checkbox'; afoCb.checked = autoFitOutputs;
+    afoCb.addEventListener('change', () => {
+      autoFitOutputs = afoCb.checked;
+      localStorage.setItem('pw-autofit-outputs', autoFitOutputs);
+      applyPanelAutoFit();
+      schedSendSettings();
+    });
+    const afoLbl = document.createElement('span'); afoLbl.textContent = 'Auto-fit Output panel to strip count';
+    afoRow.appendChild(afoCb); afoRow.appendChild(afoLbl);
+    asec.appendChild(afoRow);
+
     body.appendChild(asec);
 
     // Keyboard shortcuts
@@ -1293,22 +1641,60 @@ function openSettings() {
   // ── INPUTS tab ───────────────────────────────────────────────────────────
   } else if (settingsTab === 'inputs') {
     buildDeviceSection('Hardware Inputs', lastState.sources);
+    buildCustomNamesSection('source');
 
   // ── OUTPUTS tab ──────────────────────────────────────────────────────────
   } else if (settingsTab === 'outputs') {
     buildDeviceSection('Hardware Outputs', lastState.sinks);
+    buildCustomNamesSection('sink');
 
   // ── AUTO ROUTING tab ─────────────────────────────────────────────────────
   } else if (settingsTab === 'routing') {
+    // ── Default output for new apps ──
+    const dfsec = document.createElement('div');
+    dfsec.className = 'settings-section';
+    const dfh = document.createElement('div');
+    dfh.className = 'settings-section-title'; dfh.textContent = 'Default Output for New Apps';
+    dfsec.appendChild(dfh);
+
+    const dfDesc = document.createElement('div');
+    dfDesc.style.cssText = 'font-size:10px;color:var(--text-dim);margin-bottom:8px;line-height:1.5;';
+    dfDesc.textContent = 'When a new app stream opens and no per-app rule matches, route it here automatically. Set to "None" to leave it on the PipeWire default.';
+    dfsec.appendChild(dfDesc);
+
+    const dfRow = document.createElement('div');
+    dfRow.className = 'settings-row settings-vs-row';
+    const dfLbl = document.createElement('span'); dfLbl.textContent = 'Default output';
+    const dfSel = document.createElement('select');
+    dfSel.className = 'settings-loop-sel'; dfSel.style.flex = '1';
+
+    const noneOpt = document.createElement('option');
+    noneOpt.value = ''; noneOpt.textContent = '— None (PipeWire default) —';
+    dfSel.appendChild(noneOpt);
+    const curDefault = (lastState.settings && lastState.settings.default_app_sink) || '';
+    (lastState.sinks || []).forEach(s => {
+      const o = document.createElement('option');
+      o.value = s.name; o.textContent = shortLabel(sinkDisplayName(s), 26); o.selected = curDefault === s.name;
+      dfSel.appendChild(o);
+    });
+    if (!curDefault) dfSel.value = '';
+    dfSel.addEventListener('change', () => {
+      send({ type: 'save_settings', default_app_sink: dfSel.value });
+    });
+    dfRow.appendChild(dfLbl); dfRow.appendChild(dfSel);
+    dfsec.appendChild(dfRow);
+    body.appendChild(dfsec);
+
+    // ── Per-app rules ──
     const arsec = document.createElement('div');
     arsec.className = 'settings-section';
     const arh = document.createElement('div');
-    arh.className = 'settings-section-title'; arh.textContent = 'Auto-Routing Rules';
+    arh.className = 'settings-section-title'; arh.textContent = 'Per-App Rules';
     arsec.appendChild(arh);
 
     const arDesc = document.createElement('div');
     arDesc.style.cssText = 'font-size:10px;color:var(--text-dim);margin-bottom:8px;line-height:1.5;';
-    arDesc.textContent = 'When a new app stream opens whose name contains the match text, it is automatically routed to the chosen output.';
+    arDesc.textContent = 'When a new app stream opens whose name contains the match text, it is routed to the chosen output (overrides the default above).';
     arsec.appendChild(arDesc);
 
     let autoRoutes = (lastState.settings && lastState.settings.auto_routes) ? [...lastState.settings.auto_routes] : [];
@@ -1462,6 +1848,92 @@ function openSettings() {
     bkRow.appendChild(restoreBtn); bkRow.appendChild(restoreInput);
     bksec.appendChild(bkRow); bksec.appendChild(restoreStatus);
     body.appendChild(bksec);
+
+    const reloadSec = document.createElement('div');
+    reloadSec.className = 'settings-section';
+    const reloadH = document.createElement('div');
+    reloadH.className = 'settings-section-title'; reloadH.textContent = 'App';
+    reloadSec.appendChild(reloadH);
+    const reloadRow = document.createElement('div');
+    reloadRow.className = 'settings-row settings-backup-row';
+    const reloadBtn = document.createElement('button');
+    reloadBtn.type = 'button'; reloadBtn.className = 'settings-action-btn';
+    reloadBtn.textContent = '↺ Reload page';
+    reloadBtn.addEventListener('click', () => location.reload());
+    reloadRow.appendChild(reloadBtn);
+    reloadSec.appendChild(reloadRow);
+    body.appendChild(reloadSec);
+
+  // ── PROFILE tab ──────────────────────────────────────────────────────────
+  } else if (settingsTab === 'profile') {
+    const pSec = document.createElement('div');
+    pSec.className = 'settings-section';
+
+    const ph = document.createElement('div');
+    ph.className = 'settings-section-title'; ph.textContent = 'This Device';
+    pSec.appendChild(ph);
+
+    const nameRow = document.createElement('div');
+    nameRow.className = 'settings-row';
+    nameRow.style.cssText = 'gap:8px;align-items:center;';
+    const nameLabel = document.createElement('span');
+    nameLabel.style.cssText = 'flex:1;font-size:11px;color:var(--text);';
+    nameLabel.textContent = clientName || '(none)';
+    const switchBtn = document.createElement('button');
+    switchBtn.type = 'button'; switchBtn.className = 'settings-action-btn';
+    switchBtn.textContent = 'Switch profile';
+    switchBtn.addEventListener('click', async () => {
+      document.getElementById('settings-overlay').classList.add('hidden');
+      localStorage.removeItem('pd-client');
+      _cachedProfiles = null;
+      clientName = null;
+      clientName = await showProfileModal();
+      await _applyProfile(clientName);
+    });
+    nameRow.appendChild(nameLabel);
+    nameRow.appendChild(switchBtn);
+    pSec.appendChild(nameRow);
+
+    const ph2 = document.createElement('div');
+    ph2.className = 'settings-section-title'; ph2.textContent = 'All Profiles';
+    ph2.style.marginTop = '14px';
+    pSec.appendChild(ph2);
+
+    const profileList = document.createElement('div');
+    profileList.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;';
+    pSec.appendChild(profileList);
+
+    const renderProfileList = (profiles) => {
+      profileList.innerHTML = '';
+      if (!profiles.length) {
+        profileList.style.cssText += 'font-size:10px;color:var(--text-dim);';
+        profileList.textContent = 'No profiles yet.';
+        return;
+      }
+      profiles.forEach(name => {
+        const btn = document.createElement('button');
+        btn.type = 'button'; btn.className = 'batch-btn'; btn.textContent = name;
+        btn.style.cssText = 'font-size:9px;padding:3px 8px;' + (name === clientName ? 'border-color:var(--accent);' : '');
+        btn.addEventListener('click', async () => {
+          if (name === clientName) return;
+          document.getElementById('settings-overlay').classList.add('hidden');
+          await _applyProfile(name);
+        });
+        profileList.appendChild(btn);
+      });
+    };
+
+    if (_cachedProfiles !== null) {
+      renderProfileList(_cachedProfiles);
+    } else {
+      profileList.textContent = 'Loading…';
+      fetch('/api/profiles').then(r => r.json()).then(profiles => {
+        _cachedProfiles = profiles;
+        renderProfileList(profiles);
+      }).catch(() => { profileList.textContent = 'Could not load profiles.'; });
+    }
+
+    body.appendChild(pSec);
   }
 
   document.getElementById('settings-overlay').classList.remove('hidden');
@@ -1543,10 +2015,24 @@ function captureScene() {
 function applyScene(scene) {
   const st = scene.state;
   (st.sinks || []).forEach(s => {
+    const strip = document.querySelector(`.strip[data-type="sink"][data-index="${s.index}"]`);
+    if (strip) {
+      const fader = strip.querySelector('.fader');
+      if (fader) { fader.value = s.volume; setVol(strip, s.volume); }
+      const btn = strip.querySelector('.mute-btn');
+      if (btn) setMute(strip, btn, s.mute);
+    }
     send({ type: 'set_volume', target: 'sink',   index: s.index, volume: s.volume });
     send({ type: 'set_mute',   target: 'sink',   index: s.index, mute:   s.mute   });
   });
   (st.sources || []).forEach(s => {
+    const strip = document.querySelector(`.strip[data-type="source"][data-index="${s.index}"]`);
+    if (strip) {
+      const fader = strip.querySelector('.fader');
+      if (fader) { fader.value = s.volume; setVol(strip, s.volume); }
+      const btn = strip.querySelector('.mute-btn');
+      if (btn) setMute(strip, btn, s.mute);
+    }
     send({ type: 'set_volume', target: 'source', index: s.index, volume: s.volume });
     send({ type: 'set_mute',   target: 'source', index: s.index, mute:   s.mute   });
   });
@@ -1681,20 +2167,29 @@ function renderDefaultSinkSwitcher() {}
 // ── Macros ──────────────────────────────────────────────────────────────────
 
 const ACTION_TYPES = [
-  ['scene',            'Recall scene'],
-  ['default_sink',     'Set default output'],
-  ['mute_sink',        'Toggle mute: output'],
-  ['mute_source',      'Toggle mute: input'],
-  ['move_app_to_sink', 'Move app to output'],
-  ['media_play_pause', 'Media: Play / Pause'],
-  ['media_next',       'Media: Next'],
-  ['media_prev',       'Media: Previous'],
+  ['scene',                 'Recall scene'],
+  ['default_sink',          'Set default output'],
+  ['mute_sink',             'Toggle mute: output'],
+  ['mute_source',           'Toggle mute: input'],
+  ['move_app_to_sink',      'Move app to output'],
+  ['move_all_apps_to_sink',   'Move ALL apps to output'],
+  ['set_default_app_sink',    'Set default output for new apps'],
+  ['media_play_pause',      'Media: Play / Pause'],
+  ['media_next',            'Media: Next'],
+  ['media_prev',            'Media: Previous'],
 ];
 
 const macroToggleStates = new Map(); // id → boolean (runtime, not persisted)
 
 function saveMacros() {
-  send({ type: 'save_settings', macros });
+  schedSaveClientSettings();
+}
+
+function optimisticMute(type, index, muted) {
+  const strip = document.querySelector(`.strip[data-type="${type}"][data-index="${index}"]`);
+  if (!strip) return;
+  const btn = strip.querySelector('.mute-btn');
+  if (btn) setMute(strip, btn, muted);
 }
 
 function executeSingleAction(a) {
@@ -1709,12 +2204,20 @@ function executeSingleAction(a) {
       break;
     case 'mute_sink': {
       const sink = lastState && lastState.sinks.find(s => s.name === a.param);
-      if (sink) send({ type: 'set_mute', target: 'sink', index: sink.index, mute: !sink.mute });
+      if (sink) {
+        const nowMuted = !sink.mute;
+        optimisticMute('sink', sink.index, nowMuted);
+        send({ type: 'set_mute', target: 'sink', index: sink.index, mute: nowMuted });
+      }
       break;
     }
     case 'mute_source': {
       const src = lastState && lastState.sources.find(s => s.name === a.param);
-      if (src) send({ type: 'set_mute', target: 'source', index: src.index, mute: !src.mute });
+      if (src) {
+        const nowMuted = !src.mute;
+        optimisticMute('source', src.index, nowMuted);
+        send({ type: 'set_mute', target: 'source', index: src.index, mute: nowMuted });
+      }
       break;
     }
     case 'move_app_to_sink': {
@@ -1723,7 +2226,52 @@ function executeSingleAction(a) {
         s => (s.appName || s.mediaName || '').toLowerCase() === a.param
       );
       const sink = lastState.sinks.find(s => s.name === a.param2);
-      if (si && sink) send({ type: 'move_sink_input', index: si.index, sink: sink.index });
+      if (si && sink) {
+        const siStrip = document.querySelector(`.strip[data-type="sink-input"][data-index="${si.index}"]`);
+        if (siStrip) {
+          const sel = siStrip.querySelector('.sink-sel');
+          if (sel) sel.value = sink.index;
+          siStrip.dataset.sink = sink.index;
+          applyAppStripColors(siStrip, getAppColor(siStrip.dataset.appkey || ''), getEffectiveSinkColor(sink.index));
+        }
+        send({ type: 'move_sink_input', index: si.index, sink: sink.index });
+      }
+      break;
+    }
+    case 'move_all_apps_to_sink': {
+      if (!a.param || !lastState) break;
+      const sink = lastState.sinks.find(s => s.name === a.param);
+      if (!sink) break;
+      lastState.sinkInputs.forEach(si => {
+        const siStrip = document.querySelector(`.strip[data-type="sink-input"][data-index="${si.index}"]`);
+        if (siStrip) {
+          const sel = siStrip.querySelector('.sink-sel');
+          if (sel) sel.value = sink.index;
+          siStrip.dataset.sink = sink.index;
+          applyAppStripColors(siStrip, getAppColor(siStrip.dataset.appkey || ''), getEffectiveSinkColor(sink.index));
+        }
+        send({ type: 'move_sink_input', index: si.index, sink: sink.index });
+      });
+      break;
+    }
+    case 'set_default_app_sink': {
+      const sinkName = a.param || '';
+      send({ type: 'save_settings', default_app_sink: sinkName });
+      if (sinkName && lastState) {
+        const sink = lastState.sinks.find(s => s.name === sinkName);
+        if (sink) {
+          lastState.sinkInputs.forEach(si => {
+            const siStrip = _stripMap.get('sink-input-' + si.index);
+            if (siStrip) {
+              const sel = siStrip.querySelector('.sink-sel');
+              if (sel) sel.value = sink.index;
+              siStrip.dataset.sink = sink.index;
+              applyAppStripColors(siStrip, getAppColor(siStrip.dataset.appkey || ''), getEffectiveSinkColor(sink.index));
+            }
+            send({ type: 'move_sink_input', index: si.index, sink: sink.index });
+          });
+        }
+      }
       break;
     }
     case 'media_play_pause':
@@ -1761,7 +2309,7 @@ let _editingMacroId = null;
 
 function buildParamRow(actionObj) {
   const type = actionObj.action;
-  const needsParam = ['scene', 'default_sink', 'mute_sink', 'mute_source', 'move_app_to_sink'].includes(type);
+  const needsParam = ['scene', 'default_sink', 'mute_sink', 'mute_source', 'move_app_to_sink', 'move_all_apps_to_sink', 'set_default_app_sink'].includes(type);
   if (!needsParam) return null;
 
   function makeRow(labelText, value, onChange, buildOptions) {
@@ -1827,7 +2375,7 @@ function buildParamRow(actionObj) {
       o.value = sc.id; o.textContent = sc.icon + ' ' + sc.name; o.selected = actionObj.param === sc.id;
       sel.appendChild(o);
     });
-  } else if (type === 'default_sink' || type === 'mute_sink') {
+  } else if (type === 'default_sink' || type === 'mute_sink' || type === 'move_all_apps_to_sink' || type === 'set_default_app_sink') {
     (lastState ? lastState.sinks : []).forEach(s => {
       const o = document.createElement('option');
       o.value = s.name; o.textContent = shortLabel(sinkDisplayName(s), 26); o.selected = actionObj.param === s.name;
@@ -1861,6 +2409,8 @@ function openMacroCfg(macroId) {
   let editLabel      = macro.label || 'Macro';
   let editMode       = macro.mode || 'normal';
   let editColor      = macro.color || '#2a2a38';
+  let editW          = macro.w || 1;
+  let editH          = macro.h || 1;
   let editActions    = toArr(macro.actions);
   let editParallel   = !!macro.parallel;
   let editOffActions = (macro.offActions || []).map(a => ({ ...a }));
@@ -1983,6 +2533,27 @@ function openMacroCfg(macroId) {
     colorRow.appendChild(colorLbl); colorRow.appendChild(colorPick);
     body.appendChild(colorRow);
 
+    // ── Size ──
+    const sizeRow = document.createElement('div');
+    sizeRow.className = 'settings-row';
+    const sizeLbl = document.createElement('span');
+    sizeLbl.textContent = 'Size';
+    sizeLbl.style.cssText = 'min-width:50px;font-size:10px;color:var(--text-dim);flex-shrink:0;';
+    const wSel = document.createElement('select');
+    wSel.className = 'settings-loop-sel';
+    const xSpan = document.createElement('span');
+    xSpan.textContent = '×'; xSpan.style.cssText = 'font-size:11px;color:var(--text-dim);margin:0 4px;flex-shrink:0;';
+    const hSel = document.createElement('select');
+    hSel.className = 'settings-loop-sel';
+    [1,2,3].forEach(n => {
+      const ow = document.createElement('option'); ow.value = n; ow.textContent = n + 'W'; ow.selected = editW === n; wSel.appendChild(ow);
+      const oh = document.createElement('option'); oh.value = n; oh.textContent = n + 'H'; oh.selected = editH === n; hSel.appendChild(oh);
+    });
+    wSel.addEventListener('change', () => { editW = parseInt(wSel.value); });
+    hSel.addEventListener('change', () => { editH = parseInt(hSel.value); });
+    sizeRow.appendChild(sizeLbl); sizeRow.appendChild(wSel); sizeRow.appendChild(xSpan); sizeRow.appendChild(hSel);
+    body.appendChild(sizeRow);
+
     // ── On-press / activate actions ──
     const onTitle = editMode === 'normal' ? 'ACTIONS' : editMode === 'toggle' ? 'ON ACTIVATE' : 'ON PRESS';
     body.appendChild(makeSectionTitle(onTitle));
@@ -2015,6 +2586,7 @@ function openMacroCfg(macroId) {
       m.mode = editMode; m.color = editColor;
       m.actions = editActions; m.parallel = editParallel;
       m.offActions = editOffActions; m.offParallel = editOffPar;
+      m.w = editW; m.h = editH;
       delete m.action; delete m.param;
       saveMacros(); renderMacroGrid();
       document.getElementById('macro-cfg-overlay').classList.add('hidden');
@@ -2037,25 +2609,124 @@ function openMacroCfg(macroId) {
   document.getElementById('macro-cfg-overlay').classList.remove('hidden');
 }
 
+function duplicateMacro(id) {
+  const src = macros.find(m => m.id === id);
+  if (!src) return;
+  const copy = JSON.parse(JSON.stringify(src));
+  copy.id    = genId();
+  copy.label = (src.label || 'Macro') + ' copy';
+  const idx  = macros.findIndex(m => m.id === id);
+  macros.splice(idx + 1, 0, copy);
+  saveMacros();
+  renderMacroGrid();
+  openMacroCfg(copy.id);
+}
+
+function _dropMacroBefore(fromId, toId) {
+  if (!fromId || !toId || fromId === toId) return;
+  const fromIdx = macros.findIndex(m => m.id === fromId);
+  if (fromIdx === -1) return;
+  const [item] = macros.splice(fromIdx, 1);
+  const toIdx = macros.findIndex(m => m.id === toId);
+  if (toIdx === -1) { macros.push(item); } else { macros.splice(toIdx, 0, item); }
+  saveMacros(); renderMacroGrid();
+}
+
+function _clearDragOver() {
+  document.querySelectorAll('.macro-btn.drag-over, .macro-group-hdr.drag-over')
+    .forEach(el => el.classList.remove('drag-over'));
+}
+
+function _attachMacroDnD(el, id) {
+  el.draggable = true;
+  el.addEventListener('dragstart', e => {
+    _macroDragId = id;
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', id);
+    requestAnimationFrame(() => el.classList.add('dragging'));
+  });
+  el.addEventListener('dragend', () => {
+    el.classList.remove('dragging');
+    _macroDragId = null;
+    _clearDragOver();
+  });
+  el.addEventListener('dragover', e => {
+    if (!_macroDragId || _macroDragId === id) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    _clearDragOver();
+    el.classList.add('drag-over');
+  });
+  el.addEventListener('dragleave', e => {
+    if (!el.contains(e.relatedTarget)) el.classList.remove('drag-over');
+  });
+  el.addEventListener('drop', e => {
+    e.preventDefault();
+    el.classList.remove('drag-over');
+    _dropMacroBefore(_macroDragId, id);
+  });
+}
+
 function renderMacroGrid() {
   const grid = document.getElementById('macro-grid');
   if (!grid) return;
   grid.innerHTML = '';
 
   macros.forEach(macro => {
+    // ── Group header ────────────────────────────────────────
+    if ((macro.type || 'macro') === 'group') {
+      const hdr = document.createElement('div');
+      hdr.className = 'macro-group-hdr';
+      hdr.dataset.id = macro.id;
+
+      const grip = document.createElement('span');
+      grip.className = 'macro-grip'; grip.textContent = '⠿'; grip.title = 'Drag to reorder';
+
+      const lbl = document.createElement('span');
+      lbl.className = 'macro-group-lbl';
+      lbl.textContent = macro.label || 'Group';
+      lbl.title = 'Click to rename';
+      lbl.addEventListener('click', () => {
+        const inp = document.createElement('input');
+        inp.type = 'text'; inp.value = macro.label || 'Group'; inp.maxLength = 30;
+        inp.style.cssText = 'flex:1;min-width:0;background:var(--input-bg);border:1px solid var(--accent-dim);border-radius:3px;color:var(--text);padding:1px 4px;font-family:var(--font);font-size:9px;letter-spacing:1px;outline:none;';
+        lbl.replaceWith(inp);
+        inp.focus(); inp.select();
+        const commit = () => { macro.label = inp.value.trim() || 'Group'; saveMacros(); renderMacroGrid(); };
+        inp.addEventListener('blur', commit);
+        inp.addEventListener('keydown', ev => {
+          if (ev.key === 'Enter') { ev.preventDefault(); inp.blur(); }
+          if (ev.key === 'Escape') renderMacroGrid();
+        });
+      });
+
+      const delBtn = document.createElement('button');
+      delBtn.className = 'macro-group-del';
+      delBtn.type = 'button'; delBtn.title = 'Delete group'; delBtn.textContent = '✕';
+      delBtn.addEventListener('click', () => {
+        macros = macros.filter(m => m.id !== macro.id);
+        saveMacros(); renderMacroGrid();
+      });
+
+      hdr.appendChild(grip); hdr.appendChild(lbl); hdr.appendChild(delBtn);
+      _attachMacroDnD(hdr, macro.id);
+      grid.appendChild(hdr);
+      return;
+    }
+
+    // ── Macro button ─────────────────────────────────────────
     const btn = document.createElement('div');
     btn.className = 'macro-btn';
     btn.dataset.id = macro.id;
     btn.style.setProperty('--macro-color', macro.color || '#2a2a38');
+    btn.style.gridColumn = 'span ' + (macro.w || 1);
+    btn.style.gridRow    = 'span ' + (macro.h || 1);
     const mode = macro.mode || 'normal';
 
-    // Restore toggle active state
     if (mode === 'toggle' && macroToggleStates.get(macro.id)) btn.classList.add('active');
 
-    // ── Upper area: label, execute on click/press ──
     const main = document.createElement('div');
     main.className = 'macro-btn-main';
-
     const lbl = document.createElement('div');
     lbl.className = 'macro-label';
     lbl.textContent = macro.label || 'Macro';
@@ -2063,10 +2734,8 @@ function renderMacroGrid() {
 
     if (mode === 'momentary') {
       main.addEventListener('pointerdown', (e) => {
-        e.preventDefault();
-        main.setPointerCapture(e.pointerId);
-        btn.classList.add('active');
-        executeMacro(macro, 'on');
+        e.preventDefault(); main.setPointerCapture(e.pointerId);
+        btn.classList.add('active'); executeMacro(macro, 'on');
       });
       main.addEventListener('pointerup',     () => { btn.classList.remove('active'); executeMacro(macro, 'off'); });
       main.addEventListener('pointercancel', () => { btn.classList.remove('active'); executeMacro(macro, 'off'); });
@@ -2084,18 +2753,42 @@ function renderMacroGrid() {
         executeMacro(macro, 'on');
       });
     }
-
     btn.appendChild(main);
 
-    // ── Lower foot: click to open config ──
     const foot = document.createElement('div');
     foot.className = 'macro-btn-foot';
     const modeLabel = { normal: 'normal', momentary: 'hold', toggle: 'toggle' }[mode] || 'normal';
-    foot.textContent = modeLabel;
-    foot.addEventListener('click', (e) => { e.stopPropagation(); openMacroCfg(macro.id); });
-    btn.appendChild(foot);
 
+    const grip = document.createElement('span');
+    grip.className = 'macro-grip'; grip.textContent = '⠿'; grip.title = 'Drag to reorder';
+
+    const footLbl = document.createElement('span');
+    footLbl.className = 'macro-foot-lbl';
+    footLbl.textContent = modeLabel;
+    footLbl.addEventListener('click', (e) => { e.stopPropagation(); openMacroCfg(macro.id); });
+
+    const dupBtn = document.createElement('button');
+    dupBtn.className = 'macro-dup-btn';
+    dupBtn.type = 'button'; dupBtn.title = 'Duplicate';
+    dupBtn.textContent = '⧉';
+    dupBtn.addEventListener('click', (e) => { e.stopPropagation(); duplicateMacro(macro.id); });
+
+    foot.appendChild(grip); foot.appendChild(footLbl); foot.appendChild(dupBtn);
+    btn.appendChild(foot);
+    _attachMacroDnD(btn, macro.id);
     grid.appendChild(btn);
+  });
+
+  // Drop on empty grid area → append to end
+  grid.addEventListener('dragover', e => { if (_macroDragId) e.preventDefault(); });
+  grid.addEventListener('drop', e => {
+    if (!_macroDragId || e.target !== grid) return;
+    e.preventDefault();
+    const fromIdx = macros.findIndex(m => m.id === _macroDragId);
+    if (fromIdx === -1) return;
+    const [item] = macros.splice(fromIdx, 1);
+    macros.push(item);
+    saveMacros(); renderMacroGrid();
   });
 }
 
@@ -2103,22 +2796,82 @@ function renderMacroGrid() {
 
 function applyAppFilter() {
   const q = appFilter.toLowerCase().trim();
+  const hiddenApps = getHiddenApps();
   let visible = 0;
   document.querySelectorAll('.strip[data-type="sink-input"]').forEach(s => {
     const nameEl = s.querySelector('.app-name');
-    const name = (nameEl ? nameEl.textContent : '').toLowerCase();
-    const key  = (s.dataset.appkey || '').toLowerCase();
-    const show = !q || name.includes(q) || key.includes(q);
-    s.style.display = show ? '' : 'none';
-    if (show) visible++;
+    const name   = (nameEl ? nameEl.textContent : '').toLowerCase();
+    const key    = (s.dataset.appkey || '').toLowerCase();
+    const isHidden = hiddenApps.has(key);
+    const matchesFilter = !q || name.includes(q) || key.includes(q);
+
+    const hideBtn = s.querySelector('.app-hide-btn');
+    if (hideBtn) {
+      hideBtn.textContent = isHidden ? '↺' : '✕';
+      hideBtn.title = isHidden ? 'Restore this app' : 'Hide this app';
+    }
+
+    if (isHidden && !showHiddenApps) {
+      s.style.display = 'none';
+    } else {
+      s.style.display = matchesFilter ? '' : 'none';
+      s.classList.toggle('app-hidden', isHidden);
+      if (matchesFilter) visible++;
+    }
   });
+  updateHideAppsToggle();
   const empty = document.getElementById('empty-sinkinputs');
   if (empty) empty.style.display = (visible === 0) ? '' : 'none';
 }
 
+// ── Batch app controls ──────────────────────────────────────────────────────
+
+function visibleAppStrips() {
+  return [...document.querySelectorAll('.strip[data-type="sink-input"]')]
+    .filter(s => s.style.display !== 'none');
+}
+
+function batchMuteApps(mute) {
+  visibleAppStrips().forEach(s => {
+    const btn = s.querySelector('.mute-btn');
+    if (!btn || btn.classList.contains('on') === mute) return;
+    fadeMute(s, btn, 'sink-input', parseInt(s.dataset.index, 10), mute);
+  });
+}
+
+function batchResetApps() {
+  visibleAppStrips().forEach(s => {
+    const fader = s.querySelector('.fader');
+    if (!fader) return;
+    const idx = parseInt(s.dataset.index, 10);
+    fader.value = 100;
+    setVol(s, 100);
+    schedVol('sink-input', idx, 100);
+  });
+}
+
 // ── State handler ───────────────────────────────────────────────────────────
 
+// One-time migration: old channelNames used "type:index" keys, which break after
+// a server restart because PipeWire re-assigns indices dynamically. Migrate any
+// such entries to stable "type:name" keys using the current state.
+function _migrateChannelNames(state) {
+  let changed = false;
+  for (const dev of [...state.sinks, ...state.sources]) {
+    const type   = state.sinks.includes(dev) ? 'sink' : 'source';
+    const oldKey = type + ':' + dev.index;
+    const newKey = type + ':' + dev.name;
+    if (oldKey !== newKey && channelNames[oldKey] && !channelNames[newKey]) {
+      channelNames[newKey] = channelNames[oldKey];
+      delete channelNames[oldKey];
+      changed = true;
+    }
+  }
+  if (changed) schedSendSettings();
+}
+
 function applyState(state) {
+  _migrateChannelNames(state);
   const hidden = getHidden();
   currentSinks = state.sinks.filter(s => !hidden.has(s.name));  // shared by all dropdowns
   renderSection('strips-sources',    state.sources.filter(s => !hidden.has(s.name)), 'source',     null);
@@ -2126,6 +2879,7 @@ function applyState(state) {
   renderSection('strips-sinks',      currentSinks,                                   'sink',       null);
   fillSbSinkSel(currentSinks);
   applyAppFilter();
+  applyPanelAutoFit();
 }
 
 function onState(state) {
@@ -2143,6 +2897,7 @@ function onState(state) {
   if (state.settings && state.settings.app_colors &&
       Object.keys(state.settings.app_colors).length > 0) {
     localStorage.setItem(APP_COLORS_KEY, JSON.stringify(state.settings.app_colors));
+    _appColors = state.settings.app_colors;
   }
   if (state.settings && Array.isArray(state.settings.scenes)) {
     const incoming = JSON.stringify(state.settings.scenes);
@@ -2151,12 +2906,13 @@ function onState(state) {
       renderSceneButtons();
     }
   }
-  if (state.settings && Array.isArray(state.settings.macros)) {
-    const incoming = JSON.stringify(state.settings.macros);
-    if (incoming !== JSON.stringify(macros)) {
-      macros = state.settings.macros;
-      renderMacroGrid();
-    }
+  // One-time migration: adopt macros from shared settings if this profile has none yet
+  if (state.settings && Array.isArray(state.settings.macros) &&
+      macros.length === 0 && state.settings.macros.length > 0 && !_macrosMigrated) {
+    _macrosMigrated = true;
+    macros = state.settings.macros;
+    renderMacroGrid();
+    schedSaveClientSettings();
   }
   applyState(state);
   renderDefaultSinkSwitcher(state.sinks);
@@ -2199,16 +2955,31 @@ function initVResize(handle, topEl, storageKey) {
 
 // ── Boot ────────────────────────────────────────────────────────────────────
 
-// Media panel toggle
+// Panel visibility toggles
 applyMediaVisibility();
+applyInputsVisibility();
+applyOutputsVisibility();
 document.getElementById('toggle-media').addEventListener('click', () => {
   mediaVisible = !mediaVisible;
   localStorage.setItem('pw-media-visible', mediaVisible);
   applyMediaVisibility();
   schedSendSettings();
 });
+document.getElementById('toggle-inputs').addEventListener('click', () => {
+  inputsVisible = !inputsVisible;
+  localStorage.setItem('pw-inputs-visible', inputsVisible);
+  applyInputsVisibility();
+  schedSendSettings();
+});
+document.getElementById('toggle-outputs').addEventListener('click', () => {
+  outputsVisible = !outputsVisible;
+  localStorage.setItem('pw-outputs-visible', outputsVisible);
+  applyOutputsVisibility();
+  schedSendSettings();
+});
 
-// Zoom
+// Zoom / theme
+applyTheme();
 applyZoom();
 applyAccentColor(accentColor);
 applyStripWidth(stripWidth);
@@ -2216,8 +2987,8 @@ document.getElementById('zoom-in') .addEventListener('click', () => adjustZoom(+
 document.getElementById('zoom-out').addEventListener('click', () => adjustZoom(-ZOOM_STEP));
 
 // Panel resize handles
-initResize(document.getElementById('rh-left'),  document.getElementById('panel-inputs'),  true);
-initResize(document.getElementById('rh-right'), document.getElementById('panel-outputs'), false);
+initResize(document.getElementById('rh-left'),  document.getElementById('panel-inputs'),  true,  'pw-autofit-inputs');
+initResize(document.getElementById('rh-right'), document.getElementById('panel-outputs'), false, 'pw-autofit-outputs');
 initResize(document.getElementById('rh-media'), document.getElementById('panel-media'),   false);
 
 // Restore saved panel widths
@@ -2241,10 +3012,31 @@ if (savedSBH) {
 }
 
 // Macros
-document.getElementById('macro-add').addEventListener('click', () => {
-  macros.push({ id: genId(), label: 'Macro', color: '#2a2a38', action: 'scene', param: '' });
-  saveMacros();
-  renderMacroGrid();
+document.getElementById('macro-add').addEventListener('click', (e) => {
+  e.stopPropagation();
+  const existing = document.getElementById('_macro-add-menu');
+  if (existing) { existing.remove(); return; }
+  const menu = document.createElement('div');
+  menu.id = '_macro-add-menu';
+  menu.className = 'macro-add-menu';
+  const addBtn = document.getElementById('macro-add');
+  const rect = addBtn.getBoundingClientRect();
+  menu.style.cssText = `position:fixed;top:${Math.round(rect.bottom + 4)}px;right:${Math.round(window.innerWidth - rect.right)}px;`;
+  [
+    ['Add Macro', () => { macros.push({ id: genId(), type: 'macro', label: 'Macro', color: '#2a2a38', w: 1, h: 1 }); saveMacros(); renderMacroGrid(); openMacroCfg(macros[macros.length - 1].id); }],
+    ['Add Group', () => { macros.push({ id: genId(), type: 'group', label: 'Group' });                               saveMacros(); renderMacroGrid(); }],
+  ].forEach(([label, action]) => {
+    const item = document.createElement('button');
+    item.className = 'macro-add-menu-item'; item.type = 'button'; item.textContent = label;
+    item.addEventListener('click', () => { menu.remove(); action(); });
+    menu.appendChild(item);
+  });
+  document.body.appendChild(menu);
+  setTimeout(() => {
+    document.addEventListener('click', function closeMenu(ev) {
+      if (!menu.contains(ev.target)) { menu.remove(); document.removeEventListener('click', closeMenu); }
+    });
+  }, 0);
 });
 document.getElementById('macro-cfg-close').addEventListener('click', () =>
   document.getElementById('macro-cfg-overlay').classList.add('hidden'));
@@ -2267,6 +3059,15 @@ document.getElementById('app-filter').addEventListener('input', (e) => {
   appFilter = e.target.value;
   applyAppFilter();
 });
+
+document.getElementById('show-hidden-apps-btn').addEventListener('click', () => {
+  showHiddenApps = !showHiddenApps;
+  applyAppFilter();
+});
+
+document.getElementById('batch-mute-all').addEventListener('click',   () => batchMuteApps(true));
+document.getElementById('batch-unmute-all').addEventListener('click', () => batchMuteApps(false));
+document.getElementById('batch-reset-all').addEventListener('click',  batchResetApps);
 
 document.getElementById('settings-btn').addEventListener('click', openSettings);
 document.getElementById('settings-close').addEventListener('click', () =>
@@ -2388,5 +3189,120 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
+// ── Per-device profile management ────────────────────────────────────────────
+
+async function loadClientSettingsFromServer(name) {
+  try {
+    const r = await fetch('/api/client-settings/' + encodeURIComponent(name));
+    if (r.ok) return await r.json();
+  } catch {}
+  return {};
+}
+
+function showProfileModal() {
+  return new Promise(async resolve => {
+    let profiles = [];
+    try { profiles = await (await fetch('/api/profiles')).json(); } catch {}
+
+    const overlay = document.createElement('div');
+    overlay.className = 'settings-overlay';
+    overlay.style.cssText = 'display:flex!important;z-index:9999;';
+
+    const modal = document.createElement('div');
+    modal.className = 'settings-modal';
+    modal.style.cssText = 'max-width:360px;width:90%;';
+    modal.innerHTML = `
+      <div class="settings-hdr"><span class="panel-title">WELCOME — NAME THIS DEVICE</span></div>
+      <div class="settings-body" style="padding:16px 20px 20px;">
+        <div style="color:var(--text-dim);font-size:10px;letter-spacing:1px;margin-bottom:12px;">
+          Each device keeps its own UI layout, zoom, panel widths, and macros.
+          Audio settings (volumes, routing, scenes) are shared across all devices.
+        </div>
+        <label style="display:block;font-size:10px;letter-spacing:1px;color:var(--text-dim);margin-bottom:4px;">DEVICE NAME</label>
+        <input id="_pd-name-inp" type="text" placeholder="e.g. Desktop, iPad, Phone…"
+          style="width:100%;box-sizing:border-box;background:var(--input-bg);border:1px solid var(--accent-dim);
+                 border-radius:3px;color:var(--text);padding:6px 8px;font-family:var(--font);
+                 font-size:11px;letter-spacing:1px;outline:none;margin-bottom:14px;">
+        ${profiles.length ? `
+          <div style="font-size:10px;letter-spacing:1px;color:var(--text-dim);margin-bottom:6px;">EXISTING PROFILES</div>
+          <div id="_pd-profile-list" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px;">
+            ${profiles.map(p => `<button class="batch-btn _pd-pick" data-name="${p}" type="button"
+              style="font-size:9px;padding:3px 8px;">${p}</button>`).join('')}
+          </div>` : ''}
+        <button id="_pd-confirm" class="batch-btn" type="button"
+          style="width:100%;font-size:10px;padding:6px;">START</button>
+      </div>`;
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+
+    const inp = document.getElementById('_pd-name-inp');
+    inp.focus();
+
+    const confirm = () => {
+      const name = (inp.value || '').trim().replace(/\s+/g, '-').replace(/[^\w\-]/g, '').replace(/^-+|-+$/g, '');
+      if (!name) { inp.style.borderColor = 'var(--mute-color)'; return; }
+      overlay.remove();
+      resolve(name);
+    };
+
+    document.getElementById('_pd-confirm').addEventListener('click', confirm);
+    inp.addEventListener('keydown', e => { if (e.key === 'Enter') confirm(); });
+    document.querySelectorAll('._pd-pick').forEach(btn => {
+      btn.addEventListener('click', () => {
+        overlay.remove();
+        resolve(btn.dataset.name);
+      });
+    });
+  });
+}
+
+async function _applyProfile(name) {
+  clientName = name;
+  localStorage.setItem('pd-client', name);
+  // Server-side persistence so pywebview remembers the profile across window reopens
+  fetch('/api/native-profile', { method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }) }).catch(() => {});
+  _cachedProfiles = null;
+  const data = await loadClientSettingsFromServer(name);
+  applyClientSettings(data);
+  if (!_macrosMigrated) _macrosMigrated = Array.isArray(data.macros);
+  saveClientSettings();
+}
+
+async function initProfile() {
+  if (!clientName) {
+    // Fallback: check server-side stored profile (survives pywebview window reopens)
+    try {
+      const r = await fetch('/api/native-profile');
+      const d = await r.json();
+      if (d.name) { clientName = d.name; localStorage.setItem('pd-client', clientName); }
+    } catch {}
+  }
+  if (!clientName) {
+    const name = await showProfileModal();
+    await _applyProfile(name);
+    return;
+  }
+  const data = await loadClientSettingsFromServer(clientName);
+  applyClientSettings(data);
+  if (!_macrosMigrated) _macrosMigrated = Array.isArray(data.macros);
+  saveClientSettings();
+}
+
+initProfile();
+
 // Connect
 connect();
+
+// Pause peak delivery from the server while the tab is hidden to prevent
+// a large message backlog from freezing the UI when the tab is restored.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    send({ type: 'set_peaks_paused', paused: true });
+  } else {
+    send({ type: 'set_peaks_paused', paused: false });
+    // Zero out all VU meters so stale levels don't linger after the pause.
+    document.querySelectorAll('.vu-seg').forEach(s => { s.className = 'vu-seg'; });
+  }
+});

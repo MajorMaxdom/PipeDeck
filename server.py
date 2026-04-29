@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PipeDeck — browser-based PipeWire/PulseAudio mixer backend."""
+"""PipeDeck — PipeWire/PulseAudio mixer backend."""
 import asyncio
 import io
 import json
@@ -7,12 +7,23 @@ import os
 import re
 import struct
 import subprocess
+import sys
 import threading
 import zipfile
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
 from websockets.asyncio.server import serve
+
+try:
+    os.environ.setdefault('PYWEBVIEW_GUI', 'gtk')
+    import webview as _webview
+    _HAS_WEBVIEW = True
+except ImportError:
+    _HAS_WEBVIEW = False
+
+_NO_WINDOW   = '--no-window' in sys.argv or not _HAS_WEBVIEW
+_server_ready = threading.Event()
 
 CLIENTS: set = set()
 _main_loop: asyncio.AbstractEventLoop | None = None
@@ -22,13 +33,13 @@ WS_PORT   = int(os.environ.get("WS_PORT",   8765))
 ENV_C = {**os.environ, "LANG": "C", "LC_ALL": "C"}
 
 PEAK_RATE       = 8000            # Hz — enough for level detection, low CPU
-PEAK_CHUNK_MONO = PEAK_RATE * 2 // 10   # 100 ms s16le mono   = 1600 bytes
-PEAK_CHUNK_ST   = PEAK_RATE * 4 // 10   # 100 ms s16le stereo = 3200 bytes
 
-SOUNDS_DIR       = Path(__file__).parent / "sounds"
-VIRTUAL_CFG_FILE = Path(__file__).parent / "virtual_sinks.json"
-SETTINGS_FILE    = Path(__file__).parent / "settings.json"
+SOUNDS_DIR          = Path(__file__).parent / "sounds"
+VIRTUAL_CFG_FILE    = Path(__file__).parent / "virtual_sinks.json"
+SETTINGS_FILE       = Path(__file__).parent / "settings.json"
+CLIENT_SETTINGS_DIR = Path(__file__).parent / "client_settings"
 SOUNDS_DIR.mkdir(exist_ok=True)
+CLIENT_SETTINGS_DIR.mkdir(exist_ok=True)
 
 _sound_proc: asyncio.subprocess.Process | None = None
 
@@ -37,11 +48,13 @@ _virtual_config: list[dict] = []
 # source_name -> {mod_id, sink_name}
 _source_routes: dict[str, dict] = {}
 # Persisted settings: hidden_devices, source_routes, ui (zoom, panel_widths, etc.)
-_settings: dict = {"hidden_devices": [], "source_routes": {}, "ui": {}, "auto_routes": [], "scenes": [],
-                   "app_volumes": {}, "app_colors": {}, "macros": []}
+_settings: dict = {"hidden_devices": [], "hidden_apps": [], "source_routes": {}, "ui": {}, "auto_routes": [],
+                   "default_app_sink": "", "scenes": [], "app_volumes": {}, "app_colors": {}, "macros": []}
 
 _known_sink_input_ids: set[int] = set()
 _app_names: dict[int, str] = {}   # sink-input index → normalised app name
+_action_broadcast_task: asyncio.Task | None = None
+_peaks_paused: set = set()        # websocket connections that have paused peak delivery
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +205,38 @@ def _save_settings():
         SETTINGS_FILE.write_text(json.dumps(_settings, indent=2))
     except Exception:
         pass
+
+
+def _safe_client_name(name: str) -> str:
+    return re.sub(r'[^\w\-]', '_', name)[:40]
+
+
+def _client_settings_path(name: str) -> Path:
+    return CLIENT_SETTINGS_DIR / f"{_safe_client_name(name)}.json"
+
+
+def _load_client_settings(name: str) -> dict:
+    try:
+        p = _client_settings_path(name)
+        if p.exists():
+            return json.loads(p.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _save_client_settings(name: str, data: dict):
+    try:
+        _client_settings_path(name).write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass
+
+
+def _list_profiles() -> list[str]:
+    try:
+        return [p.stem for p in sorted(CLIENT_SETTINGS_DIR.glob("*.json"))]
+    except Exception:
+        return []
 
 
 def _restore_source_routes():
@@ -358,8 +403,10 @@ def get_state() -> dict:
         "sourceRoutes": {name: entry["sink_name"] for name, entry in _source_routes.items()},
         "settings": {
             "hidden_devices": _settings.get("hidden_devices", []),
+            "hidden_apps": _settings.get("hidden_apps", []),
             "ui": _settings.get("ui", {}),
             "auto_routes": _settings.get("auto_routes", []),
+            "default_app_sink": _settings.get("default_app_sink", ""),
             "scenes": _settings.get("scenes", []),
             "macros": _settings.get("macros", []),
             "app_colors": _settings.get("ui", {}).get("app_colors", {}),
@@ -373,15 +420,23 @@ def get_state() -> dict:
 
 class PeakMonitors:
     def __init__(self):
-        self.monitors: dict[str, tuple] = {}
-        self.peaks:    dict[str, object] = {}   # float (mono) or [float, float] (stereo)
-        self.stereo:   bool = False
+        self.monitors:    dict[str, tuple] = {}
+        self.peaks:       dict[str, object] = {}   # float (mono) or [float, float] (stereo)
+        self.stereo:      bool = False
+        self.interval_ms: int  = 100               # parec latency / chunk window
 
     def set_stereo(self, stereo: bool):
         if stereo == self.stereo:
             return
         self.stereo = stereo
-        self.stop_all()   # update() will restart monitors with new channel count
+        self.stop_all()
+
+    def set_interval_ms(self, ms: int):
+        ms = max(33, min(500, int(ms)))
+        if ms == self.interval_ms:
+            return
+        self.interval_ms = ms
+        self.stop_all()
 
     async def update(self, sinks: list, sources: list, sink_inputs: list):
         desired: dict[str, tuple[str, str]] = {}
@@ -419,17 +474,18 @@ class PeakMonitors:
 
     async def _start(self, key: str, mode: str, target: str, stereo: bool):
         ch = "2" if stereo else "1"
+        lat = f"--latency-msec={self.interval_ms}"
         props = ["--property=media.role=production",
                  "--property=application.name=PulseWire Monitor",
                  "--property=application.id=pulsewire.monitor"]
         if mode == "stream":
             cmd = ["parec", "--monitor-stream", target,
                    "--format=s16le", f"--rate={PEAK_RATE}", f"--channels={ch}",
-                   "--latency-msec=100", *props]
+                   lat, *props]
         else:
             cmd = ["parec", "-d", target,
                    "--format=s16le", f"--rate={PEAK_RATE}", f"--channels={ch}",
-                   "--latency-msec=100", *props]
+                   lat, *props]
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -443,7 +499,8 @@ class PeakMonitors:
             print(f"[peak] failed to start {key}: {e}")
 
     async def _read(self, key: str, proc, stereo: bool):
-        chunk = PEAK_CHUNK_ST if stereo else PEAK_CHUNK_MONO
+        ch = 2 if stereo else 1
+        chunk = PEAK_RATE * 2 * ch * self.interval_ms // 1000
         try:
             while True:
                 data = await proc.stdout.read(chunk)
@@ -500,6 +557,17 @@ async def broadcast(data: dict):
     CLIENTS.difference_update(dead)
 
 
+async def _schedule_action_broadcast():
+    """Broadcast updated state ~50 ms after an action, cancelling any pending broadcast."""
+    global _action_broadcast_task
+    if _action_broadcast_task and not _action_broadcast_task.done():
+        _action_broadcast_task.cancel()
+    async def _do():
+        await asyncio.sleep(0.05)
+        await broadcast(get_state())
+    _action_broadcast_task = asyncio.create_task(_do())
+
+
 async def ws_handler(websocket):
     CLIENTS.add(websocket)
     try:
@@ -512,7 +580,13 @@ async def ws_handler(websocket):
                 target = msg.get("target", "")
                 index  = str(msg.get("index", ""))
 
-                if t == "set_volume":
+                if t == "set_peaks_paused":
+                    if msg.get("paused"):
+                        _peaks_paused.add(websocket)
+                    else:
+                        _peaks_paused.discard(websocket)
+
+                elif t == "set_volume":
                     vol = max(0, min(150, int(msg["volume"])))
                     cmds = {
                         "sink":       ["pactl", "set-sink-volume",       index, f"{vol}%"],
@@ -537,6 +611,7 @@ async def ws_handler(websocket):
                     }
                     if target in cmds:
                         subprocess.run(cmds[target], check=False, env=ENV_C)
+                        await _schedule_action_broadcast()
 
                 elif t == "move_sink_input":
                     sink_index = str(msg.get("sink", ""))
@@ -545,6 +620,7 @@ async def ws_handler(websocket):
                             ["pactl", "move-sink-input", index, sink_index],
                             check=False, env=ENV_C,
                         )
+                        await _schedule_action_broadcast()
 
                 elif t == "media_cmd":
                     action = msg.get("action", "")
@@ -580,15 +656,23 @@ async def ws_handler(websocket):
                 elif t == "save_settings":
                     if "hidden_devices" in msg:
                         _settings["hidden_devices"] = msg["hidden_devices"]
+                    if "hidden_apps" in msg:
+                        _settings["hidden_apps"] = msg["hidden_apps"]
                     if "ui" in msg:
                         _settings["ui"] = msg["ui"]
                         stereo = msg["ui"].get("stereo_meters")
                         if stereo is not None:
                             peak_monitors.set_stereo(bool(stereo))
+                        vu_ms = msg["ui"].get("vu_interval_ms")
+                        if vu_ms is not None:
+                            peak_monitors.set_interval_ms(int(vu_ms))
+                        if stereo is not None or vu_ms is not None:
                             state = get_state()
                             await peak_monitors.update(state["sinks"], state["sources"], state["sinkInputs"])
                     if "auto_routes" in msg:
                         _settings["auto_routes"] = msg["auto_routes"]
+                    if "default_app_sink" in msg:
+                        _settings["default_app_sink"] = msg["default_app_sink"]
                     if "scenes" in msg:
                         _settings["scenes"] = msg["scenes"]
                     if "macros" in msg:
@@ -658,6 +742,7 @@ async def ws_handler(websocket):
         pass
     finally:
         CLIENTS.discard(websocket)
+        _peaks_paused.discard(websocket)
 
 
 # ---------------------------------------------------------------------------
@@ -673,7 +758,7 @@ async def event_watcher():
             pending.cancel()
 
         async def do_update():
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.5)
             state = get_state()
             current_ids = {si["index"] for si in state["sinkInputs"]}
 
@@ -698,7 +783,8 @@ async def event_watcher():
                              f"{app_volumes[app_name]}%"],
                             check=False, env=ENV_C,
                         )
-                    # Apply auto-routing rules
+                    # Apply auto-routing rules; fall back to default_app_sink if none match
+                    matched = False
                     for rule in rules:
                         match_str = rule.get("match", "").strip().lower()
                         sink_name = rule.get("sink_name", "")
@@ -709,7 +795,17 @@ async def event_watcher():
                                     ["pactl", "move-sink-input", str(si["index"]), str(sink["index"])],
                                     check=False, env=ENV_C,
                                 )
+                            matched = True
                             break
+                    if not matched:
+                        default_sink_name = _settings.get("default_app_sink", "")
+                        if default_sink_name:
+                            sink = next((s for s in state["sinks"] if s["name"] == default_sink_name), None)
+                            if sink:
+                                subprocess.run(
+                                    ["pactl", "move-sink-input", str(si["index"]), str(sink["index"])],
+                                    check=False, env=ENV_C,
+                                )
             _known_sink_input_ids.clear()
             _known_sink_input_ids.update(current_ids)
             # Keep app-name map current so set_volume can look up names
@@ -745,28 +841,45 @@ async def event_watcher():
 async def peak_broadcaster():
     while True:
         await asyncio.sleep(0.05)
-        if CLIENTS and peak_monitors.peaks:
-            await broadcast({"type": "peaks", "data": dict(peak_monitors.peaks)})
+        active = CLIENTS - _peaks_paused
+        if active and peak_monitors.peaks:
+            msg = json.dumps({"type": "peaks", "data": dict(peak_monitors.peaks)})
+            dead = set()
+            for client in list(active):
+                try:
+                    await client.send(msg)
+                except Exception:
+                    dead.add(client)
+            CLIENTS.difference_update(dead)
 
 
 async def state_sync():
-    """Periodic fallback: catch sink-inputs that the event watcher missed
-    (e.g. an app that was already paused unpauses via an OS hotkey)."""
+    """Periodic fallback: catch sink-inputs that the event watcher missed.
+
+    Compares (index, corked) pairs — not just indices — so that an app
+    transitioning from corked→playing (same index, different cork state) is
+    also detected and broadcast even when pactl-subscribe missed the event.
+    """
+    last_snapshot: frozenset = frozenset()
     while True:
-        await asyncio.sleep(3)
+        await asyncio.sleep(1.5)
         if not CLIENTS:
             continue
         try:
             sink_inputs = parse_blocks(run_pactl("list", "sink-inputs"), "Sink Input")
-            current_ids = {si["index"] for si in sink_inputs}
-            if current_ids == _known_sink_input_ids:
+            snapshot = frozenset(
+                (si["index"], si.get("corked", False)) for si in sink_inputs
+            )
+            if snapshot == last_snapshot:
                 continue
-            # Something changed — do a full update (reuses the same logic as do_update)
+            last_snapshot = snapshot
+            # Something changed — do a full state broadcast
             state = get_state()
             full_ids = {si["index"] for si in state["sinkInputs"]}
             new_ids  = full_ids - _known_sink_input_ids
             if new_ids:
                 app_volumes = _settings.get("app_volumes", {})
+                rules       = _settings.get("auto_routes", [])
                 for si in state["sinkInputs"]:
                     if si["index"] not in new_ids:
                         continue
@@ -777,6 +890,34 @@ async def state_sync():
                              f"{app_volumes[app_name]}%"],
                             check=False, env=ENV_C,
                         )
+                    matched = False
+                    for rule in rules:
+                        match_str = rule.get("match", "").strip().lower()
+                        sink_name = rule.get("sink_name", "")
+                        if match_str and sink_name and match_str in app_name:
+                            sink = next(
+                                (s for s in state["sinks"] if s["name"] == sink_name), None
+                            )
+                            if sink:
+                                subprocess.run(
+                                    ["pactl", "move-sink-input",
+                                     str(si["index"]), str(sink["index"])],
+                                    check=False, env=ENV_C,
+                                )
+                            matched = True
+                            break
+                    if not matched:
+                        default_sink_name = _settings.get("default_app_sink", "")
+                        if default_sink_name:
+                            sink = next(
+                                (s for s in state["sinks"] if s["name"] == default_sink_name), None
+                            )
+                            if sink:
+                                subprocess.run(
+                                    ["pactl", "move-sink-input",
+                                     str(si["index"]), str(sink["index"])],
+                                    check=False, env=ENV_C,
+                                )
             _known_sink_input_ids.clear()
             _known_sink_input_ids.update(full_ids)
             _app_names.clear()
@@ -835,6 +976,17 @@ def _http_thread():
                     self._json(200, get_state())
                 elif path == "/api/sounds":
                     self._json(200, get_sounds())
+                elif path == "/api/profiles":
+                    self._json(200, _list_profiles())
+                elif path == "/api/native-profile":
+                    try:
+                        p = Path(__file__).parent / "native_profile.json"
+                        self._json(200, json.loads(p.read_text()) if p.exists() else {})
+                    except Exception:
+                        self._json(200, {})
+                elif path.startswith("/api/client-settings/"):
+                    name = path[len("/api/client-settings/"):]
+                    self._json(200, _load_client_settings(name))
                 elif path == "/api/backup":
                     buf = io.BytesIO()
                     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -966,6 +1118,21 @@ def _http_thread():
                     except Exception as e:
                         self._json(400, {"ok": False, "error": str(e)})
 
+                elif path == "/api/native-profile":
+                    name = body.get("name", "")
+                    if name:
+                        p = Path(__file__).parent / "native_profile.json"
+                        try: p.write_text(json.dumps({"name": name}))
+                        except Exception: pass
+                    self._json(200, {"ok": True})
+                elif path.startswith("/api/client-settings/"):
+                    name = path[len("/api/client-settings/"):]
+                    if _safe_client_name(name):
+                        _save_client_settings(name, body)
+                        self._json(200, {"ok": True})
+                    else:
+                        self._json(400, {"ok": False, "error": "invalid name"})
+
                 else:
                     self._json(404, {"ok": False, "error": "not found"})
                 return
@@ -1040,16 +1207,21 @@ async def main():
     _load_virtual_cfg()
     _restore_virtual_sinks()
     _restore_source_routes()
-    peak_monitors.stereo = bool((_settings.get("ui") or {}).get("stereo_meters", False))
+    ui = _settings.get("ui") or {}
+    peak_monitors.stereo      = bool(ui.get("stereo_meters", False))
+    peak_monitors.interval_ms = max(33, min(500, int(ui.get("vu_interval_ms", 100))))
     threading.Thread(target=_http_thread, daemon=True).start()
 
     state = get_state()
     await peak_monitors.update(state["sinks"], state["sources"], state["sinkInputs"])
 
     async with serve(ws_handler, "0.0.0.0", WS_PORT):
+        _server_ready.set()
         print("PipeDeck started")
         print(f"  Local:   http://localhost:{HTTP_PORT}")
         print(f"  Network: http://<YOUR-IP>:{HTTP_PORT}")
+        if _NO_WINDOW:
+            print("  Open the URL above in your browser.")
         await asyncio.gather(
             event_watcher(),
             peak_broadcaster(),
@@ -1058,9 +1230,45 @@ async def main():
         )
 
 
-if __name__ == "__main__":
+def _run_server():
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
+        pass
+
+
+def _server_already_running() -> bool:
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(("localhost", HTTP_PORT)) == 0
+
+
+def _open_window():
+    icon = PUBLIC_DIR / "icon.png"
+    window = _webview.create_window(
+        "PipeDeck",
+        f"http://localhost:{HTTP_PORT}",
+        width=1280,
+        height=800,
+        min_size=(600, 400),
+    )
+    _webview.start(icon=str(icon) if icon.exists() else None)
+
+
+if __name__ == "__main__":
+    if _NO_WINDOW:
+        try:
+            asyncio.run(main())
+        except KeyboardInterrupt:
+            peak_monitors.stop_all()
+            print("\nStopped.")
+    elif _server_already_running():
+        # Service is already running — just open a window against it
+        print(f"PipeDeck already running at http://localhost:{HTTP_PORT}")
+        _open_window()
+    else:
+        t = threading.Thread(target=_run_server, daemon=True)
+        t.start()
+        _server_ready.wait(timeout=15)
+        _open_window()
         peak_monitors.stop_all()
-        print("\nStopped.")

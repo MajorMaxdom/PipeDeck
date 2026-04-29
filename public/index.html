@@ -12,14 +12,16 @@
   <meta name="theme-color" content="#0b0b0d">
   <link rel="manifest" href="manifest.json">
 
+  <link rel="icon" type="image/png" href="icon.png">
+  <link rel="apple-touch-icon" href="icon.png">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <div id="app">
     <header>
       <div class="logo">
-        <span class="logo-icon">▐█▌</span>
-        <span class="logo-text">PIPEDECK <span class="logo-sub">v0.31</span></span>
+        <img class="logo-icon" src="icon.png" alt="PipeDeck" onerror="this.style.display='none'">
+        <span class="logo-text">PIPEDECK <span class="logo-sub">v0.59</span></span>
       </div>
       <div class="scene-controls">
         <span id="scene-btns"></span>
@@ -29,6 +31,8 @@
         <button class="zoom-btn" id="zoom-out" type="button">−</button>
         <span id="zoom-label">100%</span>
         <button class="zoom-btn" id="zoom-in"  type="button">+</button>
+        <button class="zoom-btn" id="toggle-inputs"  type="button" title="Hide / Show Hardware Inputs">⬤</button>
+        <button class="zoom-btn" id="toggle-outputs" type="button" title="Hide / Show Master Output">◉</button>
         <button class="zoom-btn" id="toggle-media" type="button" title="Media &amp; Sounds">♫</button>
         <button class="zoom-btn" id="settings-btn" type="button" title="Settings">⚙</button>
       </div>
@@ -60,6 +64,12 @@
           <span class="panel-icon">▶</span>
           <span class="panel-title">APPLICATIONS</span>
           <input type="text" id="app-filter" class="app-filter-input" placeholder="filter…" autocomplete="off">
+          <button class="zoom-btn" id="show-hidden-apps-btn" type="button" title="Show hidden apps" style="display:none">👁</button>
+        </div>
+        <div class="batch-bar">
+          <button class="batch-btn" id="batch-mute-all"   type="button">MUTE ALL</button>
+          <button class="batch-btn" id="batch-unmute-all" type="button">UNMUTE ALL</button>
+          <button class="batch-btn" id="batch-reset-all"  type="button">RESET 100%</button>
         </div>
         <div class="strips-scroll">
           <div class="strips" id="strips-sinkinputs"></div>
