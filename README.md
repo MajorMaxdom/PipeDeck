@@ -37,7 +37,6 @@ A PipeWire / PulseAudio mixer for Linux — control volumes, routing, and virtua
 - Media player controls (via `playerctl`)
 - **Per-device profiles** — on first visit each browser/device is prompted to enter a name (or pick an existing profile); UI layout (zoom, panel widths, light mode, accent color, strip width, VU display settings, smooth mute, macros) is saved per profile; audio state (volumes, routing, scenes, channel names, app colors) stays shared across all devices; switch or create profiles in Settings → Profile
 - **Native desktop window** — if `pywebview` is installed, `python3 server.py` opens a native desktop window (no browser required); the window appears in the taskbar, can be moved/resized/minimised like any app, and shows the app icon; use `--no-window` to force headless mode for the systemd service while still using the desktop launcher separately
-- **App launcher integration** — `pipedeck.desktop` registers PipeDeck in the GNOME / KDE application launcher; place `icon.png` in `public/` for a full icon in the launcher, taskbar, window title bar, and the in-app header
 - **Browser optimizations** — VU meter updates are batched via `requestAnimationFrame` for smooth rendering; strip element lookups during peak updates use an O(1) `Map` instead of DOM attribute-selector queries; color/name/hidden-device maps are cached in memory so `JSON.parse(localStorage.getItem(...))` runs at most once per map rather than on every render cycle; `touch-action: manipulation` removes the 300 ms tap delay on iOS Safari and older Android; thin, styled scrollbars in all scroll areas (Chrome, Firefox, Safari); GPU-composited zoom via `backface-visibility`; CSS `contain: layout style` isolates each strip's paint from its siblings; background tabs pause peak broadcasting entirely to save CPU
 - **Light mode** — toggle a full light theme in Settings → Display; all panels, strips, faders, and overlays adapt; persists across restarts
 - **Accent color picker** — choose the UI highlight color in Settings
@@ -165,24 +164,6 @@ To **disable** the native window and run in headless/browser mode only:
 ```bash
 python3 server.py --no-window
 ```
-
----
-
-## App launcher integration
-
-A `pipedeck.desktop` file is included. Install it so PipeDeck appears in the GNOME / KDE application launcher:
-
-```bash
-cp pipedeck.desktop ~/.local/share/applications/
-```
-
-If the icon does not appear immediately, refresh the desktop database:
-
-```bash
-update-desktop-database ~/.local/share/applications/
-```
-
-> The `.desktop` file references absolute paths. If you move the PipeDeck folder, edit the `Exec=` and `Icon=` lines inside `pipedeck.desktop` to match the new location.
 
 ---
 
@@ -346,7 +327,6 @@ Your server's IP address is printed in the terminal / journal when PipeDeck star
 ```
 PipeDeck/
 ├── server.py              # Python backend (WebSocket + HTTP server)
-├── pipedeck.desktop       # App launcher entry (copy to ~/.local/share/applications/)
 ├── settings.json          # Shared audio settings (auto-created)
 ├── virtual_sinks.json     # Virtual sink config (auto-created)
 ├── client_settings/       # Per-device UI profiles (auto-created)
